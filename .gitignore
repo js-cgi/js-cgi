@@ -1,0 +1,11 @@
+# Binary
+jscgi
+
+# QuickJS source (downloaded by build.sh)
+quickjs/
+
+# Extension binaries
+extensions/**/*.so
+
+# Test ini files
+jscgi-test*.ini
