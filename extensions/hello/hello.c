@@ -1,4 +1,4 @@
-#include "../../jscgi-module.h"
+#include "../../js-cgi-module.h"
 
 static JSValue js_hello_world(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     return JS_NewString(ctx, "Hello from the hello extension!");

@@ -7,12 +7,16 @@
 #include <dlfcn.h>
 
 #include "quickjs/quickjs.h"
-#include "jscgi-module.h"
+#include "js-cgi-module.h"
+
+/* Forward declarations */
+static char g_script_dir[4096];
+static char *read_file(const char *path, size_t *out_len);
 
 #define DEFAULT_MEMORY_LIMIT (128 * 1024 * 1024)
 #define DEFAULT_MAX_EXECUTION_TIME 30
 #define DEFAULT_CONTENT_TYPE "text/html"
-#define INI_SYSTEM_PATH "/etc/jscgi/jscgi.ini"
+#define INI_SYSTEM_PATH "/etc/js-cgi/js-cgi.ini"
 #define INI_MAX_LINE 1024
 #define MAX_EXTENSIONS 64
 
@@ -24,13 +28,17 @@ typedef struct {
     char extension_dir[4096];
     char *extensions[MAX_EXTENSIONS];
     int extension_count;
+    int display_errors;
+    char error_log[4096];
 } jscgi_config;
 
 static void config_init(jscgi_config *cfg) {
     cfg->memory_limit = DEFAULT_MEMORY_LIMIT;
     cfg->max_execution_time = DEFAULT_MAX_EXECUTION_TIME;
-    strcpy(cfg->extension_dir, "/usr/lib/jscgi/modules");
+    strcpy(cfg->extension_dir, "/usr/lib/js-cgi/modules");
     cfg->extension_count = 0;
+    cfg->display_errors = 1;
+    cfg->error_log[0] = '\0';
 }
 
 static size_t parse_memory_value(const char *val) {
@@ -94,6 +102,10 @@ static int config_load_file(jscgi_config *cfg, const char *path) {
             if (cfg->extension_count < MAX_EXTENSIONS) {
                 cfg->extensions[cfg->extension_count++] = strdup(val);
             }
+        } else if (strcmp(key, "display_errors") == 0) {
+            cfg->display_errors = (strcasecmp(val, "On") == 0 || strcmp(val, "1") == 0);
+        } else if (strcmp(key, "error_log") == 0) {
+            strncpy(cfg->error_log, val, sizeof(cfg->error_log) - 1);
         }
     }
 
@@ -119,7 +131,7 @@ static void config_load(jscgi_config *cfg, const char *ini_override) {
         local_path[len] = '\0';
         char *slash = strrchr(local_path, '/');
         if (slash) {
-            strcpy(slash + 1, "jscgi.ini");
+            strcpy(slash + 1, "js-cgi.ini");
             config_load_file(cfg, local_path);
         }
     }
@@ -156,7 +168,7 @@ static void response_free(void) {
     free(g_response.body);
 }
 
-static void response_append_header(const char *header) {
+void response_append_header(const char *header) {
     size_t len = strlen(header);
     while (g_response.headers_len + len + 3 > g_response.headers_cap) {
         g_response.headers_cap *= 2;
@@ -229,6 +241,61 @@ static JSValue js_print(JSContext *ctx, JSValueConst this_val, int argc, JSValue
             JS_FreeCString(ctx, str);
         }
     }
+    return JS_UNDEFINED;
+}
+
+/* -------------------- JS API: include() -------------------- */
+
+static JSValue js_include(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "include requires a file path");
+    }
+
+    const char *path = JS_ToCString(ctx, argv[0]);
+    if (!path) return JS_EXCEPTION;
+
+    /* Resolve relative to script directory */
+    char resolved[4096];
+    if (path[0] == '/') {
+        snprintf(resolved, sizeof(resolved), "%s", path);
+    } else {
+        snprintf(resolved, sizeof(resolved), "%s/%s", g_script_dir, path);
+    }
+    JS_FreeCString(ctx, path);
+
+    /* Resolve /./ in path */
+    char cleaned[4096];
+    char *src = resolved;
+    char *dst = cleaned;
+    while (*src) {
+        if (src[0] == '/' && src[1] == '.' && src[2] == '/') {
+            src += 2;
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+
+    /* Read the file */
+    size_t file_len;
+    char *source = read_file(cleaned, &file_len);
+    if (!source) {
+        return JS_ThrowReferenceError(ctx, "Cannot include '%s': file not found", cleaned);
+    }
+
+    /* Get filename for error reporting */
+    const char *filename = strrchr(cleaned, '/');
+    filename = filename ? filename + 1 : cleaned;
+
+    /* Execute in the current context */
+    JSValue result = JS_Eval(ctx, source, file_len, filename, JS_EVAL_TYPE_GLOBAL);
+    free(source);
+
+    if (JS_IsException(result)) {
+        return result;
+    }
+
+    JS_FreeValue(ctx, result);
     return JS_UNDEFINED;
 }
 
@@ -377,7 +444,92 @@ static JSValue build_request_object(JSContext *ctx) {
     JS_SetPropertyStr(ctx, req, "body", JS_NewString(ctx, body));
     free(body);
 
+    /* cookies */
+    JSValue cookies = JS_NewObject(ctx);
+    const char *cookie_str = getenv("HTTP_COOKIE");
+    if (cookie_str) {
+        char *copy = strdup(cookie_str);
+        char *pair = strtok(copy, ";");
+        while (pair) {
+            while (*pair == ' ') pair++;
+            char *eq = strchr(pair, '=');
+            if (eq) {
+                *eq = '\0';
+                JS_SetPropertyStr(ctx, cookies, pair, JS_NewString(ctx, eq + 1));
+            }
+            pair = strtok(NULL, ";");
+        }
+        free(copy);
+    }
+    JS_SetPropertyStr(ctx, req, "cookies", cookies);
+
     return req;
+}
+
+static JSValue js_response_set_cookie(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "setCookie requires a name and value");
+    }
+
+    const char *name = JS_ToCString(ctx, argv[0]);
+    const char *value = JS_ToCString(ctx, argv[1]);
+    if (!name || !value) {
+        if (name) JS_FreeCString(ctx, name);
+        if (value) JS_FreeCString(ctx, value);
+        return JS_EXCEPTION;
+    }
+
+    char cookie[4096];
+    int pos = snprintf(cookie, sizeof(cookie), "Set-Cookie: %s=%s; Path=/", name, value);
+
+    /* Optional options object as 3rd argument */
+    if (argc > 2 && JS_IsObject(argv[2])) {
+        JSValue opt;
+
+        opt = JS_GetPropertyStr(ctx, argv[2], "path");
+        if (JS_IsString(opt)) {
+            const char *p = JS_ToCString(ctx, opt);
+            /* Overwrite the Path we already set */
+            pos = snprintf(cookie, sizeof(cookie), "Set-Cookie: %s=%s; Path=%s", name, value, p);
+            JS_FreeCString(ctx, p);
+        }
+        JS_FreeValue(ctx, opt);
+
+        opt = JS_GetPropertyStr(ctx, argv[2], "maxAge");
+        if (JS_IsNumber(opt)) {
+            int64_t max_age;
+            JS_ToInt64(ctx, &max_age, opt);
+            pos += snprintf(cookie + pos, sizeof(cookie) - pos, "; Max-Age=%ld", (long)max_age);
+        }
+        JS_FreeValue(ctx, opt);
+
+        opt = JS_GetPropertyStr(ctx, argv[2], "httpOnly");
+        if (JS_ToBool(ctx, opt)) {
+            pos += snprintf(cookie + pos, sizeof(cookie) - pos, "; HttpOnly");
+        }
+        JS_FreeValue(ctx, opt);
+
+        opt = JS_GetPropertyStr(ctx, argv[2], "secure");
+        if (JS_ToBool(ctx, opt)) {
+            pos += snprintf(cookie + pos, sizeof(cookie) - pos, "; Secure");
+        }
+        JS_FreeValue(ctx, opt);
+
+        opt = JS_GetPropertyStr(ctx, argv[2], "sameSite");
+        if (JS_IsString(opt)) {
+            const char *ss = JS_ToCString(ctx, opt);
+            pos += snprintf(cookie + pos, sizeof(cookie) - pos, "; SameSite=%s", ss);
+            JS_FreeCString(ctx, ss);
+        }
+        JS_FreeValue(ctx, opt);
+    }
+
+    JS_FreeCString(ctx, name);
+    JS_FreeCString(ctx, value);
+
+    response_append_header(cookie);
+
+    return JS_UNDEFINED;
 }
 
 static JSValue build_response_object(JSContext *ctx) {
@@ -386,6 +538,8 @@ static JSValue build_response_object(JSContext *ctx) {
         JS_NewCFunction(ctx, js_response_set_header, "setHeader", 2));
     JS_SetPropertyStr(ctx, resp, "setStatus",
         JS_NewCFunction(ctx, js_response_set_status, "setStatus", 1));
+    JS_SetPropertyStr(ctx, resp, "setCookie",
+        JS_NewCFunction(ctx, js_response_set_cookie, "setCookie", 3));
     return resp;
 }
 
@@ -409,8 +563,6 @@ static char *read_file(const char *path, size_t *out_len) {
 }
 
 /* -------------------- Module loader -------------------- */
-
-static char g_script_dir[4096];
 
 static char *module_normalize(JSContext *ctx, const char *module_base_name,
                               const char *module_name, void *opaque) {
@@ -493,27 +645,27 @@ static int load_extensions(jscgi_config *cfg, JSContext *ctx, JSValue global) {
 
         void *handle = dlopen(path, RTLD_NOW);
         if (!handle) {
-            fprintf(stderr, "jscgi: Failed to load extension '%s': %s\n", cfg->extensions[i], dlerror());
+            fprintf(stderr, "js-cgi: Failed to load extension '%s': %s\n", cfg->extensions[i], dlerror());
             continue;
         }
 
         jscgi_module_entry *(*get_module)(void) = dlsym(handle, "jscgi_get_module");
         if (!get_module) {
-            fprintf(stderr, "jscgi: Extension '%s' missing jscgi_get_module symbol\n", cfg->extensions[i]);
+            fprintf(stderr, "js-cgi: Extension '%s' missing jscgi_get_module symbol\n", cfg->extensions[i]);
             dlclose(handle);
             continue;
         }
 
         jscgi_module_entry *entry = get_module();
         if (!entry) {
-            fprintf(stderr, "jscgi: Extension '%s' returned NULL module entry\n", cfg->extensions[i]);
+            fprintf(stderr, "js-cgi: Extension '%s' returned NULL module entry\n", cfg->extensions[i]);
             dlclose(handle);
             continue;
         }
 
         if (entry->module_init) {
             if (entry->module_init(ctx, global) != 0) {
-                fprintf(stderr, "jscgi: Extension '%s' init failed\n", entry->name);
+                fprintf(stderr, "js-cgi: Extension '%s' init failed\n", entry->name);
                 dlclose(handle);
                 continue;
             }
@@ -541,11 +693,41 @@ static void unload_extensions(void) {
 
 /* -------------------- Main -------------------- */
 
+static jscgi_config *g_cfg = NULL;
+
+static void log_error(const char *msg) {
+    if (g_cfg && g_cfg->error_log[0]) {
+        FILE *fp = fopen(g_cfg->error_log, "a");
+        if (fp) {
+            fprintf(fp, "[js-cgi] %s\n", msg);
+            fclose(fp);
+        }
+    }
+    fprintf(stderr, "[js-cgi] %s\n", msg);
+}
+
 static void output_error(const char *msg) {
+    log_error(msg);
+
     printf("Status: 500\r\n");
-    printf("Content-Type: text/plain\r\n");
+    printf("Content-Type: text/html\r\n");
     printf("\r\n");
-    printf("Internal Server Error: %s\n", msg);
+
+    if (g_cfg && !g_cfg->display_errors) {
+        printf("<!DOCTYPE html>\n<html>\n<head><title>500 Internal Server Error</title></head>\n<body>\n");
+        printf("<h1>Internal Server Error</h1>\n");
+        printf("<p>The server encountered an internal error and was unable to complete your request.</p>\n");
+        printf("<hr>\n");
+        printf("<address>js-cgi/" CONFIG_VERSION "</address>\n");
+        printf("</body>\n</html>\n");
+    } else {
+        printf("<!DOCTYPE html>\n<html>\n<head><title>500 Internal Server Error</title></head>\n<body>\n");
+        printf("<h1>Internal Server Error</h1>\n");
+        printf("<pre>%s</pre>\n", msg);
+        printf("<hr>\n");
+        printf("<address>js-cgi/" CONFIG_VERSION "</address>\n");
+        printf("</body>\n</html>\n");
+    }
 }
 
 int main(int argc, char **argv) {
@@ -578,6 +760,7 @@ int main(int argc, char **argv) {
     /* Load configuration */
     jscgi_config cfg;
     config_load(&cfg, ini_override);
+    g_cfg = &cfg;
 
     /* Read the script */
     size_t script_len;
@@ -609,6 +792,10 @@ int main(int argc, char **argv) {
     /* print() */
     JS_SetPropertyStr(ctx, global, "print",
         JS_NewCFunction(ctx, js_print, "print", 1));
+
+    /* include() */
+    JS_SetPropertyStr(ctx, global, "include",
+        JS_NewCFunction(ctx, js_include, "include", 1));
 
     /* request */
     JS_SetPropertyStr(ctx, global, "request", build_request_object(ctx));
@@ -684,9 +871,9 @@ int main(int argc, char **argv) {
     }
 
     JS_FreeValue(ctx, result);
+    unload_extensions();
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
-    unload_extensions();
     response_free();
     free(script);
 

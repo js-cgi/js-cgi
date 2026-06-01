@@ -1,4 +1,4 @@
-# jscgi
+# js-cgi
 
 A lightweight JavaScript CGI engine. Run modern JavaScript on your web server the same way you run PHP — drop `.js` files in a directory and they're served as web pages.
 
@@ -9,11 +9,12 @@ Powered by QuickJS-ng for full ES2023+ support.
 - Full ES2023+ JavaScript (modules, async/await, generators, destructuring, etc.)
 - CGI interface for Apache and Nginx
 - `request` and `response` globals for handling HTTP
-- `print()` for output
+- `print()` and `include()` built-ins
 - ES module support (`import`/`export` from local files)
+- Cookie and session support
 - Shared extension system (`.so` modules like PHP extensions)
 - Memory and execution time limits
-- Stack traces in error output
+- Configurable error display and logging
 - Configurable via ini file
 
 ## Requirements
@@ -21,17 +22,20 @@ Powered by QuickJS-ng for full ES2023+ support.
 - GCC
 - Make
 - Git
+- libsqlite3-dev (for sqlite extension)
+- libssl-dev (for crypto extension)
+- libcurl4-openssl-dev (for http extension)
 
 ## Installation
 
 ```bash
-git clone <repo-url> jscgi
-cd jscgi
+git clone <repo-url> js-cgi
+cd js-cgi
 ./build.sh
-sudo cp jscgi /usr/lib/cgi-bin/jscgi
-sudo mkdir -p /etc/jscgi
-sudo cp jscgi.ini /etc/jscgi/jscgi.ini
-sudo mkdir -p /usr/lib/jscgi/modules
+sudo cp js-cgi /usr/lib/cgi-bin/js-cgi
+sudo mkdir -p /etc/js-cgi
+sudo cp js-cgi.ini /etc/js-cgi/js-cgi.ini
+sudo mkdir -p /usr/lib/js-cgi/modules
 ```
 
 ## Apache Configuration
@@ -48,8 +52,8 @@ Create a site config:
 <VirtualHost *:80>
     DocumentRoot /var/www/js
 
-    Action jscgi /cgi-bin/jscgi
-    AddHandler jscgi .js
+    Action js-cgi /cgi-bin/js-cgi
+    AddHandler js-cgi .js
 
     ScriptAlias /cgi-bin/ /usr/lib/cgi-bin/
 
@@ -67,7 +71,7 @@ Create a site config:
 Enable and restart:
 
 ```bash
-sudo a2ensite jscgi
+sudo a2ensite js-cgi
 sudo systemctl restart apache2
 ```
 
@@ -82,7 +86,7 @@ print(`<h1>Hello, ${name}!</h1>`);
 
 Visit `http://localhost/index.js?name=Developer`
 
-## API
+## Core API
 
 ### request
 
@@ -94,6 +98,7 @@ Visit `http://localhost/index.js?name=Developer`
 | `request.query` | Parsed query string as object |
 | `request.headers` | Request headers as object (lowercase keys) |
 | `request.body` | Request body as string |
+| `request.cookies` | Parsed cookies as object |
 
 ### response
 
@@ -101,6 +106,9 @@ Visit `http://localhost/index.js?name=Developer`
 |--------|-------------|
 | `response.setHeader(name, value)` | Set a response header |
 | `response.setStatus(code)` | Set the HTTP status code |
+| `response.setCookie(name, value, options?)` | Set a cookie |
+
+Cookie options: `{ path, maxAge, httpOnly, secure, sameSite }`
 
 ### print()
 
@@ -114,6 +122,16 @@ Content-Type defaults to `text/html`. Override with:
 ```js
 response.setHeader("Content-Type", "application/json");
 ```
+
+### include()
+
+```js
+include("./header.js");
+print("<p>Page content</p>");
+include("./footer.js");
+```
+
+Resolves paths relative to the current script. Included files share the same context.
 
 ## ES Modules
 
@@ -133,9 +151,97 @@ export function greet(name) {
 }
 ```
 
+## Extensions
+
+### Session (session.so)
+
+File-backed sessions with cookie-based session IDs.
+
+```js
+session.start();
+session.set("user", "Alice");
+session.get("user");    // "Alice"
+session.destroy();      // End session
+```
+
+### SQLite (sqlite.so)
+
+Embedded SQLite database access with parameterised queries.
+
+```js
+const db = sqlite.open("/var/www/data/app.db");
+
+db.exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)");
+db.exec("INSERT INTO users (name) VALUES (?)", ["Alice"]);
+
+const users = db.query("SELECT * FROM users");
+const user = db.queryOne("SELECT * FROM users WHERE id = ?", [1]);
+
+db.lastInsertId();      // Last auto-increment ID
+db.changes();           // Rows affected by last statement
+db.tableExists("users"); // true/false
+
+db.beginTransaction();
+db.exec("INSERT INTO users (name) VALUES (?)", ["Bob"]);
+db.commit();            // or db.rollback()
+
+db.close();
+```
+
+### File (file.so)
+
+Filesystem access.
+
+```js
+file.write("/tmp/data.txt", "Hello");
+file.append("/tmp/data.txt", "\nWorld");
+file.read("/tmp/data.txt");     // "Hello\nWorld"
+file.exists("/tmp/data.txt");   // true
+file.size("/tmp/data.txt");     // 11
+file.isDir("/tmp");             // true
+file.list("/tmp");              // ["data.txt", ...]
+file.delete("/tmp/data.txt");
+```
+
+### Crypto (crypto.so)
+
+Hashing, HMAC, and random generation.
+
+```js
+crypto.md5("hello");        // hex string
+crypto.sha1("hello");       // hex string
+crypto.sha256("hello");     // hex string
+crypto.sha512("hello");     // hex string
+
+crypto.hmac("sha256", "secret-key", "data");  // hex string
+
+crypto.randomBytes(16);     // 32-char hex string (16 bytes)
+crypto.uuid();              // v4 UUID
+```
+
+### HTTP (http.so)
+
+Make outbound HTTP requests.
+
+```js
+const res = http.get("https://api.example.com/data");
+// res.status, res.body, res.headers
+
+const res = http.post(
+    "https://api.example.com/data",
+    JSON.stringify({ name: "Alice" }),
+    { "Content-Type": "application/json" }
+);
+
+http.put(url, body, headers);
+http.delete(url, headers);
+```
+
+All methods return `{ status, body, headers }`.
+
 ## Configuration
 
-`/etc/jscgi/jscgi.ini`:
+`/etc/js-cgi/js-cgi.ini`:
 
 ```ini
 # Maximum memory a script can use (supports K, M, G suffixes)
@@ -144,18 +250,28 @@ memory_limit = 128M
 # Maximum execution time in seconds
 max_execution_time = 30
 
+# Show errors in browser (On) or hide them (Off)
+display_errors = On
+
+# Log errors to file
+error_log = /var/log/js-cgi/error.log
+
 # Directory where extensions are loaded from
-extension_dir = /usr/lib/jscgi/modules
+extension_dir = /usr/lib/js-cgi/modules
 
 # Load extensions
-extension = example.so
+extension = session.so
+extension = sqlite.so
+extension = file.so
+extension = crypto.so
+extension = http.so
 ```
 
 ### INI load order
 
-1. `/etc/jscgi/jscgi.ini` (system-wide)
-2. `jscgi.ini` in the same directory as the binary (local override)
-3. `--ini=/path/to/jscgi.ini` flag (takes precedence over both)
+1. `/etc/js-cgi/js-cgi.ini` (system-wide)
+2. `js-cgi.ini` in the same directory as the binary (local override)
+3. `--ini=/path/to/js-cgi.ini` flag (takes precedence over both)
 
 ## Writing Extensions
 
@@ -164,7 +280,7 @@ Extensions are shared libraries (`.so`) that register JavaScript functions and o
 ### Extension structure
 
 ```c
-#include "jscgi-module.h"
+#include "js-cgi-module.h"
 
 static JSValue js_my_function(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv) {
@@ -187,16 +303,16 @@ JSCGI_MODULE(my_ext, "1.0.0", my_ext_init, my_ext_shutdown);
 ### Building an extension
 
 ```bash
-gcc -shared -fPIC -O2 -I/path/to/jscgi -o my_ext.so my_ext.c
+gcc -shared -fPIC -O2 -I/path/to/js-cgi -o my_ext.so my_ext.c
 ```
 
 ### Installing an extension
 
 ```bash
-sudo cp my_ext.so /usr/lib/jscgi/modules/
+sudo cp my_ext.so /usr/lib/js-cgi/modules/
 ```
 
-Add to `/etc/jscgi/jscgi.ini`:
+Add to `/etc/js-cgi/js-cgi.ini`:
 
 ```ini
 extension = my_ext.so
