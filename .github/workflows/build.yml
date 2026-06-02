@@ -54,33 +54,29 @@ jobs:
           path: dist/js-cgi-linux-x86_64.tar.gz
 
   build-linux-arm64:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu make git libsqlite3-dev libssl-dev libcurl4-openssl-dev
-          sudo dpkg --add-architecture arm64
-          sudo apt-get update
-          sudo apt-get install -y libsqlite3-dev:arm64 libssl-dev:arm64 libcurl4-openssl-dev:arm64 || true
+          sudo apt-get install -y gcc make git libsqlite3-dev libssl-dev libcurl4-openssl-dev
 
       - name: Download QuickJS-ng
         run: |
           git clone --depth 1 https://github.com/quickjs-ng/quickjs.git quickjs
 
       - name: Build js-cgi
-        run: |
-          make CC=aarch64-linux-gnu-gcc
+        run: make
 
       - name: Build extensions
         run: |
-          aarch64-linux-gnu-gcc -shared -fPIC -O2 -I. -o extensions/sqlite/sqlite.so extensions/sqlite/sqlite.c -lsqlite3
-          aarch64-linux-gnu-gcc -shared -fPIC -O2 -I. -o extensions/crypto/crypto.so extensions/crypto/crypto.c -lssl -lcrypto
-          aarch64-linux-gnu-gcc -shared -fPIC -O2 -I. -o extensions/http/http.so extensions/http/http.c -lcurl
-          aarch64-linux-gnu-gcc -shared -fPIC -O2 -I. -o extensions/session/session.so extensions/session/session.c
-          aarch64-linux-gnu-gcc -shared -fPIC -O2 -I. -o extensions/file/file.so extensions/file/file.c
+          gcc -shared -fPIC -O2 -I. -o extensions/sqlite/sqlite.so extensions/sqlite/sqlite.c -lsqlite3
+          gcc -shared -fPIC -O2 -I. -o extensions/crypto/crypto.so extensions/crypto/crypto.c -lssl -lcrypto
+          gcc -shared -fPIC -O2 -I. -o extensions/http/http.so extensions/http/http.c -lcurl
+          gcc -shared -fPIC -O2 -I. -o extensions/session/session.so extensions/session/session.c
+          gcc -shared -fPIC -O2 -I. -o extensions/file/file.so extensions/file/file.c
 
       - name: Package
         run: |
@@ -90,7 +86,6 @@ jobs:
           cp extensions/crypto/crypto.so dist/js-cgi/modules/
           cp extensions/http/http.so dist/js-cgi/modules/
           cp extensions/session/session.so dist/js-cgi/modules/
-          cp extensions/http/http.so dist/js-cgi/modules/
           cp extensions/file/file.so dist/js-cgi/modules/
           cp js-cgi.ini dist/js-cgi/
           cp js-cgi-module.h dist/js-cgi/
