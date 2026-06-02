@@ -255,7 +255,7 @@ static JSValue js_include(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     if (!path) return JS_EXCEPTION;
 
     /* Resolve relative to script directory */
-    char resolved[4096];
+    char resolved[8192];
     if (path[0] == '/') {
         snprintf(resolved, sizeof(resolved), "%s", path);
     } else {
@@ -566,7 +566,7 @@ static char *read_file(const char *path, size_t *out_len) {
 
 static char *module_normalize(JSContext *ctx, const char *module_base_name,
                               const char *module_name, void *opaque) {
-    char tmp[4096];
+    char tmp[8192];
 
     if (module_name[0] == '/') {
         snprintf(tmp, sizeof(tmp), "%s", module_name);

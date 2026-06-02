@@ -24,7 +24,8 @@ static void generate_session_id(void) {
     unsigned char rand_bytes[SESSION_ID_LEN];
 
     if (fp) {
-        fread(rand_bytes, 1, SESSION_ID_LEN, fp);
+        size_t n = fread(rand_bytes, 1, SESSION_ID_LEN, fp);
+        (void)n;
         fclose(fp);
     } else {
         srand(time(NULL) ^ getpid());

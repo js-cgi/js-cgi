@@ -2,7 +2,7 @@
 
 A lightweight JavaScript CGI engine. Run modern JavaScript on your web server the same way you run PHP — drop `.js` files in a directory and they're served as web pages.
 
-Powered by QuickJS-ng for full ES2023+ support.
+Full ES2023+ JavaScript support. No Node.js required.
 
 ## Features
 
@@ -17,7 +17,13 @@ Powered by QuickJS-ng for full ES2023+ support.
 - Configurable error display and logging
 - Configurable via ini file
 
-## Requirements
+## Platform Support
+
+- **Linux** (x86_64, arm64) — fully supported, pre-built binaries available
+- **macOS** — coming soon
+- **Windows** — coming soon
+
+## Requirements (Linux)
 
 - GCC
 - Make
@@ -302,8 +308,10 @@ JSCGI_MODULE(my_ext, "1.0.0", my_ext_init, my_ext_shutdown);
 
 ### Building an extension
 
+The only file needed is `js-cgi-module.h` (installed to `/usr/include/js-cgi/` or included in the download archive):
+
 ```bash
-gcc -shared -fPIC -O2 -I/path/to/js-cgi -o my_ext.so my_ext.c
+gcc -shared -fPIC -O2 -I/usr/include/js-cgi -o my_ext.so my_ext.c
 ```
 
 ### Installing an extension
@@ -333,7 +341,7 @@ JSCGI_MODULE(name, version, init_function, shutdown_function);
 | `init_function` | Called on startup, receives JSContext and global object |
 | `shutdown_function` | Called on shutdown (can be NULL) |
 
-The init function receives the QuickJS context and global object. Use the QuickJS C API to register functions, objects, or any JavaScript values.
+The init function receives the js-cgi context and global object. Use the js-cgi C API (defined in `js-cgi-module.h`) to register functions, objects, or any JavaScript values.
 
 ## License
 
