@@ -4,6 +4,8 @@ A lightweight JavaScript CGI engine. Run modern JavaScript on your web server �
 
 Full ES2023+ JavaScript support. No Node.js required.
 
+**Website:** [js-cgi.com](https://js-cgi.com) — documentation, downloads, and examples. The site itself is built with and powered by js-cgi v0.1.0.
+
 ## About
 
 js-cgi was created by Andrew Stubbs, a developer who has been writing software since the age of 10. The idea first came about around 15 years ago while learning PHP — the thought was simple: why can't I just write web pages in JavaScript the same way I write them in PHP?
