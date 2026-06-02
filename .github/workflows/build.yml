@@ -1,0 +1,128 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 0.1.0)'
+        required: true
+        default: '0.1.0'
+
+jobs:
+  build-linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc make git libsqlite3-dev libssl-dev libcurl4-openssl-dev
+
+      - name: Download QuickJS-ng
+        run: |
+          git clone --depth 1 https://github.com/quickjs-ng/quickjs.git quickjs
+
+      - name: Build js-cgi
+        run: make
+
+      - name: Build extensions
+        run: |
+          gcc -shared -fPIC -O2 -I. -o extensions/sqlite/sqlite.so extensions/sqlite/sqlite.c -lsqlite3
+          gcc -shared -fPIC -O2 -I. -o extensions/crypto/crypto.so extensions/crypto/crypto.c -lssl -lcrypto
+          gcc -shared -fPIC -O2 -I. -o extensions/http/http.so extensions/http/http.c -lcurl
+          gcc -shared -fPIC -O2 -I. -o extensions/session/session.so extensions/session/session.c
+          gcc -shared -fPIC -O2 -I. -o extensions/file/file.so extensions/file/file.c
+
+      - name: Package
+        run: |
+          mkdir -p dist/js-cgi/modules
+          cp js-cgi dist/js-cgi/
+          cp extensions/sqlite/sqlite.so dist/js-cgi/modules/
+          cp extensions/crypto/crypto.so dist/js-cgi/modules/
+          cp extensions/http/http.so dist/js-cgi/modules/
+          cp extensions/session/session.so dist/js-cgi/modules/
+          cp extensions/file/file.so dist/js-cgi/modules/
+          cp js-cgi.ini dist/js-cgi/
+          cp js-cgi-module.h dist/js-cgi/
+          cd dist && tar -czf js-cgi-linux-x86_64.tar.gz js-cgi/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-cgi-linux-x86_64
+          path: dist/js-cgi-linux-x86_64.tar.gz
+
+  build-linux-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu make git libsqlite3-dev libssl-dev libcurl4-openssl-dev
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev:arm64 libssl-dev:arm64 libcurl4-openssl-dev:arm64 || true
+
+      - name: Download QuickJS-ng
+        run: |
+          git clone --depth 1 https://github.com/quickjs-ng/quickjs.git quickjs
+
+      - name: Build js-cgi
+        run: |
+          make CC=aarch64-linux-gnu-gcc
+
+      - name: Build extensions
+        run: |
+          aarch64-linux-gnu-gcc -shared -fPIC -O2 -I. -o extensions/sqlite/sqlite.so extensions/sqlite/sqlite.c -lsqlite3
+          aarch64-linux-gnu-gcc -shared -fPIC -O2 -I. -o extensions/crypto/crypto.so extensions/crypto/crypto.c -lssl -lcrypto
+          aarch64-linux-gnu-gcc -shared -fPIC -O2 -I. -o extensions/http/http.so extensions/http/http.c -lcurl
+          aarch64-linux-gnu-gcc -shared -fPIC -O2 -I. -o extensions/session/session.so extensions/session/session.c
+          aarch64-linux-gnu-gcc -shared -fPIC -O2 -I. -o extensions/file/file.so extensions/file/file.c
+
+      - name: Package
+        run: |
+          mkdir -p dist/js-cgi/modules
+          cp js-cgi dist/js-cgi/
+          cp extensions/sqlite/sqlite.so dist/js-cgi/modules/
+          cp extensions/crypto/crypto.so dist/js-cgi/modules/
+          cp extensions/http/http.so dist/js-cgi/modules/
+          cp extensions/session/session.so dist/js-cgi/modules/
+          cp extensions/http/http.so dist/js-cgi/modules/
+          cp extensions/file/file.so dist/js-cgi/modules/
+          cp js-cgi.ini dist/js-cgi/
+          cp js-cgi-module.h dist/js-cgi/
+          cd dist && tar -czf js-cgi-linux-arm64.tar.gz js-cgi/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-cgi-linux-arm64
+          path: dist/js-cgi-linux-arm64.tar.gz
+
+  release:
+    needs: [build-linux-x86_64, build-linux-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: js-cgi-linux-x86_64
+
+      - name: Download arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: js-cgi-linux-arm64
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.event.inputs.version }}
+          name: js-cgi v${{ github.event.inputs.version }}
+          files: |
+            js-cgi-linux-x86_64.tar.gz
+            js-cgi-linux-arm64.tar.gz
