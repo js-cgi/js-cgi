@@ -1,8 +1,20 @@
 # js-cgi
 
-A lightweight JavaScript CGI engine. Run modern JavaScript on your web server the same way you run PHP — drop `.js` files in a directory and they're served as web pages.
+A lightweight JavaScript CGI engine. Run modern JavaScript on your web server — drop `.js` files in a directory and they're served as web pages.
 
 Full ES2023+ JavaScript support. No Node.js required.
+
+## About
+
+js-cgi was created by Andrew Stubbs, a developer who has been writing software since the age of 10. The idea first came about around 15 years ago while learning PHP — the thought was simple: why can't I just write web pages in JavaScript the same way I write them in PHP?
+
+At the time, server-side JavaScript wasn't really a thing. Then Node.js came along and changed everything — but it brought with it a world of frameworks, package managers, and build tools. The original idea of just dropping a script on a server and having it run was lost somewhere along the way.
+
+js-cgi brings that simplicity back. No runtime to manage, no dependencies to install, no build step. Just JavaScript, a web server, and your code.
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for planned features including FastCGI support, a built-in development server, and macOS/Windows support.
 
 ## Features
 
