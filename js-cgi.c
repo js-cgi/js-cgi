@@ -705,14 +705,20 @@ static void unload_extensions(void) {
 static jscgi_config *g_cfg = NULL;
 
 static void log_error(const char *msg) {
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm);
+
     if (g_cfg && g_cfg->error_log[0]) {
         FILE *fp = fopen(g_cfg->error_log, "a");
         if (fp) {
-            fprintf(fp, "[js-cgi] %s\n", msg);
+            fprintf(fp, "[%s] [js-cgi] %s\n", ts, msg);
             fclose(fp);
         }
     }
-    fprintf(stderr, "[js-cgi] %s\n", msg);
+    fprintf(stderr, "[%s] [js-cgi] %s\n", ts, msg);
 }
 
 static void output_error(const char *msg) {
