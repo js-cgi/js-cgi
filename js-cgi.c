@@ -5,6 +5,12 @@
 #include <unistd.h>
 #include <signal.h>
 #include <dlfcn.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 #include "quickjs/quickjs.h"
 #include "js-cgi-module.h"
@@ -745,17 +751,472 @@ static void output_error(const char *msg) {
     }
 }
 
+/* -------------------- Development server -------------------- */
+
+static const char *mime_type_for(const char *path) {
+    const char *ext = strrchr(path, '.');
+    if (!ext) return "application/octet-stream";
+    ext++;
+    if (strcasecmp(ext, "html") == 0 || strcasecmp(ext, "htm") == 0) return "text/html";
+    if (strcasecmp(ext, "css") == 0) return "text/css";
+    if (strcasecmp(ext, "png") == 0) return "image/png";
+    if (strcasecmp(ext, "jpg") == 0 || strcasecmp(ext, "jpeg") == 0) return "image/jpeg";
+    if (strcasecmp(ext, "gif") == 0) return "image/gif";
+    if (strcasecmp(ext, "svg") == 0) return "image/svg+xml";
+    if (strcasecmp(ext, "ico") == 0) return "image/x-icon";
+    if (strcasecmp(ext, "json") == 0) return "application/json";
+    if (strcasecmp(ext, "txt") == 0) return "text/plain";
+    if (strcasecmp(ext, "woff") == 0) return "font/woff";
+    if (strcasecmp(ext, "woff2") == 0) return "font/woff2";
+    if (strcasecmp(ext, "ttf") == 0) return "font/ttf";
+    if (strcasecmp(ext, "xml") == 0) return "application/xml";
+    if (strcasecmp(ext, "pdf") == 0) return "application/pdf";
+    if (strcasecmp(ext, "wasm") == 0) return "application/wasm";
+    return "application/octet-stream";
+}
+
+static void serve_static(int client_fd, const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        dprintf(client_fd, "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n"
+                "<h1>404 Not Found</h1>\n");
+        return;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    long size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    const char *mime = mime_type_for(path);
+    dprintf(client_fd, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %ld\r\n\r\n", mime, size);
+
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        (void)write(client_fd, buf, n);
+    }
+    fclose(fp);
+}
+
+static void handle_request(int client_fd, const char *doc_root, const char *ini_override) {
+    char request_buf[65536];
+    ssize_t total = 0;
+    ssize_t n;
+
+    /* Read the request headers */
+    while (total < (ssize_t)sizeof(request_buf) - 1) {
+        n = read(client_fd, request_buf + total, sizeof(request_buf) - 1 - total);
+        if (n <= 0) break;
+        total += n;
+        request_buf[total] = '\0';
+        if (strstr(request_buf, "\r\n\r\n")) break;
+    }
+
+    if (total <= 0) return;
+
+    /* Parse request line */
+    char method[16] = {0};
+    char uri[4096] = {0};
+    sscanf(request_buf, "%15s %4095s", method, uri);
+
+    /* Separate path and query string */
+    char path[4096];
+    char query_string[4096] = {0};
+    char *qmark = strchr(uri, '?');
+    if (qmark) {
+        size_t plen = qmark - uri;
+        if (plen >= sizeof(path)) plen = sizeof(path) - 1;
+        memcpy(path, uri, plen);
+        path[plen] = '\0';
+        snprintf(query_string, sizeof(query_string), "%s", qmark + 1);
+    } else {
+        snprintf(path, sizeof(path), "%s", uri);
+    }
+
+    /* Resolve file path */
+    char file_path[8192];
+    snprintf(file_path, sizeof(file_path), "%s%s", doc_root, path);
+
+    /* Directory index */
+    struct stat st;
+    if (stat(file_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        size_t len = strlen(file_path);
+        if (len > 0 && file_path[len - 1] != '/') {
+            file_path[len] = '/';
+            file_path[len + 1] = '\0';
+        }
+        strncat(file_path, "index.js", sizeof(file_path) - strlen(file_path) - 1);
+        if (stat(file_path, &st) != 0) {
+            /* Try index.html */
+            file_path[strlen(file_path) - 8] = '\0';
+            strncat(file_path, "index.html", sizeof(file_path) - strlen(file_path) - 1);
+        }
+    }
+
+    /* Check if file exists */
+    if (stat(file_path, &st) != 0) {
+        dprintf(client_fd, "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n"
+                "<h1>404 Not Found</h1><p>%s</p>\n", path);
+        fprintf(stderr, "[%s] 404 %s %s\n", method, path, "Not Found");
+        return;
+    }
+
+    /* If not a .js file, serve static */
+    const char *ext = strrchr(file_path, '.');
+    if (!ext || strcasecmp(ext, ".js") != 0) {
+        serve_static(client_fd, file_path);
+        fprintf(stderr, "[%s] 200 %s (static)\n", method, path);
+        return;
+    }
+
+    /* Parse headers for CGI env */
+    char content_type[256] = {0};
+    char content_length[32] = {0};
+    char cookie[4096] = {0};
+    char *headers_start = strstr(request_buf, "\r\n");
+    if (headers_start) {
+        headers_start += 2;
+        char *line = headers_start;
+        while (line && *line && !(line[0] == '\r' && line[1] == '\n')) {
+            char *eol = strstr(line, "\r\n");
+            if (!eol) break;
+            *eol = '\0';
+
+            if (strncasecmp(line, "Content-Type:", 13) == 0) {
+                char *val = line + 13;
+                while (*val == ' ') val++;
+                strncpy(content_type, val, sizeof(content_type) - 1);
+            } else if (strncasecmp(line, "Content-Length:", 15) == 0) {
+                char *val = line + 15;
+                while (*val == ' ') val++;
+                strncpy(content_length, val, sizeof(content_length) - 1);
+            } else if (strncasecmp(line, "Cookie:", 7) == 0) {
+                char *val = line + 7;
+                while (*val == ' ') val++;
+                strncpy(cookie, val, sizeof(cookie) - 1);
+            }
+
+            *eol = '\r';
+            line = eol + 2;
+        }
+    }
+
+    /* Read request body if present */
+    char *body_start = strstr(request_buf, "\r\n\r\n");
+    char *body_data = NULL;
+    size_t body_len = 0;
+    if (body_start) {
+        body_start += 4;
+        body_len = total - (body_start - request_buf);
+        int cl = content_length[0] ? atoi(content_length) : 0;
+        if (cl > (int)body_len) {
+            body_data = malloc(cl + 1);
+            memcpy(body_data, body_start, body_len);
+            while ((int)body_len < cl) {
+                n = read(client_fd, body_data + body_len, cl - body_len);
+                if (n <= 0) break;
+                body_len += n;
+            }
+            body_data[body_len] = '\0';
+        } else if (body_len > 0) {
+            body_data = malloc(body_len + 1);
+            memcpy(body_data, body_start, body_len);
+            body_data[body_len] = '\0';
+        }
+    }
+
+    /* Fork and run js-cgi engine via CGI environment */
+    int pipefd[2];
+    if (pipe(pipefd) < 0) {
+        dprintf(client_fd, "HTTP/1.1 500 Internal Server Error\r\n\r\n");
+        free(body_data);
+        return;
+    }
+
+    /* Pipe for request body (stdin of child) */
+    int body_pipe[2] = {-1, -1};
+    if (body_data && body_len > 0) {
+        if (pipe(body_pipe) < 0) {
+            dprintf(client_fd, "HTTP/1.1 500 Internal Server Error\r\n\r\n");
+            free(body_data);
+            close(pipefd[0]);
+            close(pipefd[1]);
+            return;
+        }
+    }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Child: set up CGI env and run engine */
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+
+        if (body_pipe[0] >= 0) {
+            close(body_pipe[1]);
+            dup2(body_pipe[0], STDIN_FILENO);
+            close(body_pipe[0]);
+        }
+
+        setenv("REQUEST_METHOD", method, 1);
+        setenv("REQUEST_URI", uri, 1);
+        setenv("QUERY_STRING", query_string, 1);
+        setenv("PATH_TRANSLATED", file_path, 1);
+        setenv("SCRIPT_FILENAME", file_path, 1);
+        setenv("DOCUMENT_ROOT", doc_root, 1);
+        if (content_type[0]) setenv("CONTENT_TYPE", content_type, 1);
+        if (content_length[0]) setenv("CONTENT_LENGTH", content_length, 1);
+        if (cookie[0]) setenv("HTTP_COOKIE", cookie, 1);
+
+        /* Pass all HTTP_* headers */
+        if (headers_start) {
+            char *line = headers_start;
+            while (line && *line && !(line[0] == '\r' && line[1] == '\n')) {
+                char *eol = strstr(line, "\r\n");
+                if (!eol) break;
+                *eol = '\0';
+
+                char *colon = strchr(line, ':');
+                if (colon) {
+                    *colon = '\0';
+                    char *val = colon + 1;
+                    while (*val == ' ') val++;
+
+                    /* Convert header name to HTTP_UPPER_CASE */
+                    char env_name[256] = "HTTP_";
+                    size_t i;
+                    for (i = 0; i < strlen(line) && i < 245; i++) {
+                        char c = line[i];
+                        if (c == '-') env_name[5 + i] = '_';
+                        else if (c >= 'a' && c <= 'z') env_name[5 + i] = c - 32;
+                        else env_name[5 + i] = c;
+                    }
+                    env_name[5 + i] = '\0';
+
+                    setenv(env_name, val, 1);
+                    *colon = ':';
+                }
+
+                *eol = '\r';
+                line = eol + 2;
+            }
+        }
+
+        /* Re-exec ourselves to run the script */
+        char *args[4];
+        args[0] = (char *)"js-cgi";
+        int ai = 1;
+        char ini_arg[4112];
+        if (ini_override) {
+            snprintf(ini_arg, sizeof(ini_arg), "--ini=%s", ini_override);
+            args[ai++] = ini_arg;
+        }
+        args[ai++] = (char *)file_path;
+        args[ai] = NULL;
+
+        execv("/proc/self/exe", args);
+        _exit(1);
+    }
+
+    /* Parent */
+    close(pipefd[1]);
+
+    /* Write body to child's stdin */
+    if (body_pipe[1] >= 0) {
+        close(body_pipe[0]);
+        if (body_data && body_len > 0) {
+            (void)write(body_pipe[1], body_data, body_len);
+        }
+        close(body_pipe[1]);
+    }
+    free(body_data);
+
+    /* Read CGI response from child */
+    char response_buf[1048576];
+    size_t resp_total = 0;
+    while ((n = read(pipefd[0], response_buf + resp_total, sizeof(response_buf) - 1 - resp_total)) > 0) {
+        resp_total += n;
+    }
+    response_buf[resp_total] = '\0';
+    close(pipefd[0]);
+
+    int status;
+    waitpid(pid, &status, 0);
+
+    /* Parse CGI output: convert Status header to HTTP status line */
+    char *resp_headers_end = strstr(response_buf, "\r\n\r\n");
+    if (!resp_headers_end) {
+        dprintf(client_fd, "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\n\r\n"
+                "<h1>500 Internal Server Error</h1><p>Malformed CGI response</p>\n");
+        fprintf(stderr, "[%s] 500 %s\n", method, path);
+        return;
+    }
+
+    /* Extract status code from CGI headers */
+    int http_status = 200;
+    char *status_line = strstr(response_buf, "Status: ");
+    if (status_line && status_line < resp_headers_end) {
+        http_status = atoi(status_line + 8);
+    }
+
+    /* Build HTTP response */
+    const char *reason = "OK";
+    if (http_status == 201) reason = "Created";
+    else if (http_status == 204) reason = "No Content";
+    else if (http_status == 301) reason = "Moved Permanently";
+    else if (http_status == 302) reason = "Found";
+    else if (http_status == 304) reason = "Not Modified";
+    else if (http_status == 400) reason = "Bad Request";
+    else if (http_status == 401) reason = "Unauthorized";
+    else if (http_status == 403) reason = "Forbidden";
+    else if (http_status == 404) reason = "Not Found";
+    else if (http_status == 405) reason = "Method Not Allowed";
+    else if (http_status == 500) reason = "Internal Server Error";
+    dprintf(client_fd, "HTTP/1.1 %d %s\r\n", http_status, reason);
+
+    /* Write headers, skipping the Status: line */
+    char *hdr = response_buf;
+    while (hdr < resp_headers_end) {
+        char *eol = strstr(hdr, "\r\n");
+        if (!eol) break;
+        if (strncmp(hdr, "Status:", 7) != 0) {
+            (void)write(client_fd, hdr, eol - hdr + 2);
+        }
+        hdr = eol + 2;
+    }
+
+    /* End of headers + body */
+    (void)write(client_fd, "\r\n", 2);
+    char *body_out = resp_headers_end + 4;
+    size_t body_out_len = resp_total - (body_out - response_buf);
+    if (body_out_len > 0) {
+        (void)write(client_fd, body_out, body_out_len);
+    }
+
+    fprintf(stderr, "[%s] %d %s\n", method, http_status, path);
+}
+
+static void reap_children(int sig) {
+    (void)sig;
+    while (waitpid(-1, NULL, WNOHANG) > 0) {}
+}
+
+static int run_dev_server(const char *host, int port, const char *doc_root, const char *ini_override) {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        fprintf(stderr, "Error: cannot create socket\n");
+        return 1;
+    }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
+        addr.sin_addr.s_addr = INADDR_ANY;
+    }
+
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "Error: cannot bind to %s:%d — %s\n", host, port, strerror(errno));
+        close(server_fd);
+        return 1;
+    }
+
+    if (listen(server_fd, 64) < 0) {
+        fprintf(stderr, "Error: listen failed — %s\n", strerror(errno));
+        close(server_fd);
+        return 1;
+    }
+
+    /* Reap zombie child processes */
+    struct sigaction sa;
+    sa.sa_handler = reap_children;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGCHLD, &sa, NULL);
+
+    fprintf(stderr, "js-cgi development server\n");
+    fprintf(stderr, "Listening on http://%s:%d\n", host, port);
+    fprintf(stderr, "Document root: %s\n", doc_root);
+    fprintf(stderr, "Press Ctrl+C to stop.\n\n");
+
+    while (1) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        if (client_fd < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(server_fd);
+            handle_request(client_fd, doc_root, ini_override);
+            close(client_fd);
+            _exit(0);
+        }
+        close(client_fd);
+    }
+
+    close(server_fd);
+    return 0;
+}
+
+/* -------------------- Main -------------------- */
+
 int main(int argc, char **argv) {
     const char *ini_override = NULL;
     const char *script_path = NULL;
+    const char *serve_arg = NULL;
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--ini=", 6) == 0) {
             ini_override = argv[i] + 6;
+        } else if (strcmp(argv[i], "--serve") == 0) {
+            serve_arg = (i + 1 < argc) ? argv[++i] : "8000";
         } else {
             script_path = argv[i];
         }
+    }
+
+    /* Dev server mode */
+    if (serve_arg) {
+        char host[256] = "localhost";
+        int port = 8000;
+
+        /* Parse host:port or just port */
+        const char *colon = strchr(serve_arg, ':');
+        if (colon) {
+            size_t hlen = colon - serve_arg;
+            if (hlen >= sizeof(host)) hlen = sizeof(host) - 1;
+            memcpy(host, serve_arg, hlen);
+            host[hlen] = '\0';
+            port = atoi(colon + 1);
+        } else {
+            port = atoi(serve_arg);
+        }
+
+        /* Document root defaults to cwd */
+        char doc_root[4096];
+        if (script_path) {
+            char *rp = realpath(script_path, doc_root);
+            if (!rp) {
+                fprintf(stderr, "Error: invalid document root '%s'\n", script_path);
+                return 1;
+            }
+        } else {
+            if (!getcwd(doc_root, sizeof(doc_root))) {
+                fprintf(stderr, "Error: cannot determine working directory\n");
+                return 1;
+            }
+        }
+
+        return run_dev_server(host, port, doc_root, ini_override);
     }
 
     /* In CGI mode, script path comes from environment.

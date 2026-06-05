@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -O2 -Wall -D_GNU_SOURCE -DCONFIG_VERSION=\"0.1.0\"
+CFLAGS = -O2 -Wall -Wno-unused-result -D_GNU_SOURCE -DCONFIG_VERSION=\"0.1.0\"
 INCLUDES = -I.
 QUICKJS_SRC = quickjs/quickjs.c quickjs/libregexp.c quickjs/libunicode.c quickjs/dtoa.c
 

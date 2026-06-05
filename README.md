@@ -97,14 +97,48 @@ sudo systemctl restart apache2
 
 ## Quick Start
 
-Create `/var/www/js/index.js`:
+Create a file called `index.js`:
 
 ```js
 const name = request.query.name || "World";
 print(`<h1>Hello, ${name}!</h1>`);
 ```
 
-Visit `http://localhost/index.js?name=Developer`
+Start the development server:
+
+```bash
+js-cgi --serve 8000
+```
+
+Visit `http://localhost:8000/?name=Developer`
+
+## Development Server
+
+js-cgi includes a built-in development server. No Apache or Nginx required for local development.
+
+```bash
+# Start on default port (8000)
+js-cgi --serve
+
+# Specify port
+js-cgi --serve 3000
+
+# Specify host and port
+js-cgi --serve 0.0.0.0:8080
+
+# Specify document root
+js-cgi --serve 8000 /path/to/project
+
+# With a custom ini file
+js-cgi --ini=/path/to/js-cgi.ini --serve 8000
+```
+
+The dev server:
+- Runs `.js` files through the js-cgi engine
+- Serves static files (HTML, CSS, images, etc.) directly
+- Uses `index.js` as the directory index (falls back to `index.html`)
+- Forks per request (same isolation as production CGI)
+- Logs requests to the terminal
 
 ## Core API
 
