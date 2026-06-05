@@ -140,6 +140,55 @@ The dev server:
 - Forks per request (same isolation as production CGI)
 - Logs requests to the terminal
 
+## FastCGI
+
+For production deployments, js-cgi supports FastCGI — a persistent process mode that avoids the overhead of spawning a new process per request.
+
+```bash
+# Listen on a TCP port
+js-cgi --fastcgi 9000
+
+# Listen on a Unix socket
+js-cgi --fastcgi /var/run/js-cgi.sock
+
+# Specify host and port
+js-cgi --fastcgi 127.0.0.1:9000
+
+# Set number of worker processes (default: 4)
+js-cgi --fastcgi 9000 --workers 8
+
+# With a custom ini file
+js-cgi --ini=/etc/js-cgi/js-cgi.ini --fastcgi /var/run/js-cgi.sock --workers 4
+```
+
+### Nginx configuration
+
+```nginx
+server {
+    listen 80;
+    root /var/www/js;
+
+    location ~ \.js$ {
+        fastcgi_pass unix:/var/run/js-cgi.sock;
+        # Or: fastcgi_pass 127.0.0.1:9000;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    }
+}
+```
+
+### Apache configuration (mod_proxy_fcgi)
+
+```apache
+<VirtualHost *:80>
+    DocumentRoot /var/www/js
+
+    <FilesMatch "\.js$">
+        SetHandler "proxy:fcgi://127.0.0.1:9000"
+    </FilesMatch>
+</VirtualHost>
+```
+
 ## Core API
 
 ### request

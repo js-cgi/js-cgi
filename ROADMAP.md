@@ -5,10 +5,10 @@ Planned features and improvements for js-cgi.
 ## Done
 
 - **Built-in development server** — `js-cgi --serve [port]` for local development without Apache/Nginx
+- **FastCGI support** — `js-cgi --fastcgi [addr] --workers N` for persistent process mode
 
 ## Upcoming
 
-- **FastCGI support** — persistent process mode for better performance under load
 - **macOS support** — pre-built binaries for x86_64 and arm64
 - **Windows support** — pre-built binaries for x86_64
 

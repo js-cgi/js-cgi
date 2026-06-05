@@ -7,6 +7,7 @@
 #include <dlfcn.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -751,6 +752,621 @@ static void output_error(const char *msg) {
     }
 }
 
+/* -------------------- Script execution engine -------------------- */
+
+typedef struct {
+    const char *method;
+    const char *uri;
+    const char *query_string;
+    const char *content_type;
+    const char *content_length;
+    const char *cookie;
+    const char *script_filename;
+    const char *body;
+    size_t body_len;
+    /* Full params for header passthrough */
+    char **params;
+    int param_count;
+} cgi_request;
+
+static int execute_script(jscgi_config *cfg, const char *script_path, cgi_request *req) {
+    /* Read the script */
+    size_t script_len;
+    char *script = read_file(script_path, &script_len);
+    if (!script) {
+        output_error("Cannot read script file");
+        return 1;
+    }
+
+    /* Initialize response */
+    response_init();
+
+    /* Create QuickJS runtime */
+    JSRuntime *rt = JS_NewRuntime();
+    JS_SetMemoryLimit(rt, cfg->memory_limit);
+    JS_SetMaxStackSize(rt, 1024 * 1024);
+
+    /* Set up interrupt handler for time limit */
+    g_start_time = get_time_ms();
+    g_max_execution_time = cfg->max_execution_time;
+    JS_SetInterruptHandler(rt, interrupt_handler, NULL);
+
+    /* Create context */
+    JSContext *ctx = JS_NewContext(rt);
+
+    /* Set up CGI env vars if we have a request struct */
+    if (req) {
+        if (req->method) setenv("REQUEST_METHOD", req->method, 1);
+        if (req->uri) setenv("REQUEST_URI", req->uri, 1);
+        if (req->query_string) setenv("QUERY_STRING", req->query_string, 1);
+        if (req->content_type) setenv("CONTENT_TYPE", req->content_type, 1);
+        if (req->content_length) setenv("CONTENT_LENGTH", req->content_length, 1);
+        if (req->cookie) setenv("HTTP_COOKIE", req->cookie, 1);
+        setenv("PATH_TRANSLATED", script_path, 1);
+        setenv("SCRIPT_FILENAME", script_path, 1);
+
+        /* Set all params as env vars */
+        for (int i = 0; i < req->param_count; i += 2) {
+            setenv(req->params[i], req->params[i + 1], 1);
+        }
+    }
+
+    /* Set up globals */
+    JSValue global = JS_GetGlobalObject(ctx);
+
+    JS_SetPropertyStr(ctx, global, "print",
+        JS_NewCFunction(ctx, js_print, "print", 1));
+    JS_SetPropertyStr(ctx, global, "include",
+        JS_NewCFunction(ctx, js_include, "include", 1));
+    JS_SetPropertyStr(ctx, global, "request", build_request_object(ctx));
+    JS_SetPropertyStr(ctx, global, "response", build_response_object(ctx));
+
+    load_extensions(cfg, ctx, global);
+    JS_FreeValue(ctx, global);
+
+    /* Determine script directory for module resolution */
+    const char *last_slash = strrchr(script_path, '/');
+    if (last_slash) {
+        size_t dir_len = last_slash - script_path;
+        memcpy(g_script_dir, script_path, dir_len);
+        g_script_dir[dir_len] = '\0';
+    } else {
+        strcpy(g_script_dir, ".");
+    }
+
+    JS_SetModuleLoaderFunc(rt, module_normalize, module_loader, NULL);
+
+    /* Detect module syntax */
+    int eval_flags = JS_EVAL_TYPE_GLOBAL;
+    if (strstr(script, "import ") || strstr(script, "export ")) {
+        eval_flags = JS_EVAL_TYPE_MODULE;
+    }
+
+    /* Execute script */
+    const char *filename = last_slash ? last_slash + 1 : script_path;
+    JSValue result = JS_Eval(ctx, script, script_len, filename, eval_flags);
+
+    /* Drain the job queue */
+    if (!JS_IsException(result)) {
+        JSContext *ctx1;
+        int ret;
+        while ((ret = JS_ExecutePendingJob(rt, &ctx1)) > 0) {}
+        if (ret < 0) {
+            JS_FreeValue(ctx, result);
+            result = JS_EXCEPTION;
+        }
+    }
+
+    int success = 1;
+    if (JS_IsException(result)) {
+        JSValue exc = JS_GetException(ctx);
+        const char *msg = JS_ToCString(ctx, exc);
+
+        uint64_t elapsed = get_time_ms() - g_start_time;
+        if (elapsed >= (uint64_t)g_max_execution_time * 1000) {
+            output_error("Maximum execution time exceeded");
+        } else {
+            char err_buf[4096];
+            const char *stack = NULL;
+            if (JS_IsObject(exc)) {
+                JSValue stack_val = JS_GetPropertyStr(ctx, exc, "stack");
+                if (JS_IsString(stack_val)) {
+                    stack = JS_ToCString(ctx, stack_val);
+                }
+                JS_FreeValue(ctx, stack_val);
+            }
+
+            if (msg && stack) {
+                snprintf(err_buf, sizeof(err_buf), "%s\n%s", msg, stack);
+            } else if (msg) {
+                snprintf(err_buf, sizeof(err_buf), "%s", msg);
+            } else {
+                snprintf(err_buf, sizeof(err_buf), "Unknown error");
+            }
+
+            output_error(err_buf);
+            if (stack) JS_FreeCString(ctx, stack);
+        }
+
+        if (msg) JS_FreeCString(ctx, msg);
+        JS_FreeValue(ctx, exc);
+        success = 0;
+    } else {
+        response_output();
+    }
+
+    JS_FreeValue(ctx, result);
+    unload_extensions();
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    response_free();
+    free(script);
+
+    return success ? 0 : 1;
+}
+
+/* -------------------- FastCGI protocol -------------------- */
+
+#define FCGI_VERSION_1       1
+#define FCGI_BEGIN_REQUEST   1
+#define FCGI_ABORT_REQUEST   2
+#define FCGI_END_REQUEST     3
+#define FCGI_PARAMS          4
+#define FCGI_STDIN           5
+#define FCGI_STDOUT          6
+#define FCGI_STDERR          7
+
+#define FCGI_RESPONDER       1
+#define FCGI_REQUEST_COMPLETE 0
+
+typedef struct {
+    unsigned char version;
+    unsigned char type;
+    unsigned char requestIdB1;
+    unsigned char requestIdB0;
+    unsigned char contentLengthB1;
+    unsigned char contentLengthB0;
+    unsigned char paddingLength;
+    unsigned char reserved;
+} fcgi_header;
+
+static int fcgi_read_exact(int fd, void *buf, size_t count) {
+    size_t total = 0;
+    while (total < count) {
+        ssize_t n = read(fd, (char *)buf + total, count - total);
+        if (n <= 0) return -1;
+        total += n;
+    }
+    return 0;
+}
+
+static int fcgi_write_record(int fd, int type, int request_id,
+                             const char *data, size_t len) {
+    while (len > 0 || type == FCGI_STDOUT) {
+        size_t chunk = len > 65535 ? 65535 : len;
+        fcgi_header hdr;
+        hdr.version = FCGI_VERSION_1;
+        hdr.type = type;
+        hdr.requestIdB1 = (request_id >> 8) & 0xFF;
+        hdr.requestIdB0 = request_id & 0xFF;
+        hdr.contentLengthB1 = (chunk >> 8) & 0xFF;
+        hdr.contentLengthB0 = chunk & 0xFF;
+        hdr.paddingLength = 0;
+        hdr.reserved = 0;
+
+        if (write(fd, &hdr, sizeof(hdr)) != sizeof(hdr)) return -1;
+        if (chunk > 0) {
+            if (write(fd, data, chunk) != (ssize_t)chunk) return -1;
+            data += chunk;
+            len -= chunk;
+        }
+        if (type == FCGI_STDOUT && chunk == 0) break;
+        if (len == 0 && type != FCGI_STDOUT) break;
+    }
+    return 0;
+}
+
+static int fcgi_write_end_request(int fd, int request_id, int app_status) {
+    fcgi_header hdr;
+    hdr.version = FCGI_VERSION_1;
+    hdr.type = FCGI_END_REQUEST;
+    hdr.requestIdB1 = (request_id >> 8) & 0xFF;
+    hdr.requestIdB0 = request_id & 0xFF;
+    hdr.contentLengthB1 = 0;
+    hdr.contentLengthB0 = 8;
+    hdr.paddingLength = 0;
+    hdr.reserved = 0;
+
+    unsigned char body[8] = {0};
+    body[0] = (app_status >> 24) & 0xFF;
+    body[1] = (app_status >> 16) & 0xFF;
+    body[2] = (app_status >> 8) & 0xFF;
+    body[3] = app_status & 0xFF;
+    body[4] = FCGI_REQUEST_COMPLETE;
+
+    if (write(fd, &hdr, sizeof(hdr)) != sizeof(hdr)) return -1;
+    if (write(fd, body, 8) != 8) return -1;
+    return 0;
+}
+
+static int fcgi_decode_name_value(const char *buf, size_t buf_len,
+                                  char **params, int *param_count, int max_params) {
+    size_t pos = 0;
+    while (pos < buf_len && *param_count < max_params - 1) {
+        uint32_t name_len, value_len;
+
+        if (pos >= buf_len) break;
+        if ((unsigned char)buf[pos] >> 7) {
+            if (pos + 4 > buf_len) break;
+            name_len = ((unsigned char)buf[pos] & 0x7F) << 24 |
+                       (unsigned char)buf[pos+1] << 16 |
+                       (unsigned char)buf[pos+2] << 8 |
+                       (unsigned char)buf[pos+3];
+            pos += 4;
+        } else {
+            name_len = (unsigned char)buf[pos];
+            pos += 1;
+        }
+
+        if (pos >= buf_len) break;
+        if ((unsigned char)buf[pos] >> 7) {
+            if (pos + 4 > buf_len) break;
+            value_len = ((unsigned char)buf[pos] & 0x7F) << 24 |
+                        (unsigned char)buf[pos+1] << 16 |
+                        (unsigned char)buf[pos+2] << 8 |
+                        (unsigned char)buf[pos+3];
+            pos += 4;
+        } else {
+            value_len = (unsigned char)buf[pos];
+            pos += 1;
+        }
+
+        if (pos + name_len + value_len > buf_len) break;
+
+        char *name = malloc(name_len + 1);
+        memcpy(name, buf + pos, name_len);
+        name[name_len] = '\0';
+        pos += name_len;
+
+        char *value = malloc(value_len + 1);
+        memcpy(value, buf + pos, value_len);
+        value[value_len] = '\0';
+        pos += value_len;
+
+        params[*param_count] = name;
+        params[*param_count + 1] = value;
+        *param_count += 2;
+    }
+    return 0;
+}
+
+static void fcgi_handle_connection(int client_fd, jscgi_config *cfg) {
+    fcgi_header hdr;
+    int request_id = 0;
+
+    char *params_buf = NULL;
+    size_t params_buf_len = 0;
+    size_t params_buf_cap = 0;
+
+    char *stdin_buf = NULL;
+    size_t stdin_buf_len = 0;
+    size_t stdin_buf_cap = 0;
+
+    int params_done = 0;
+    int stdin_done = 0;
+    int keep_conn = 0;
+
+    while (fcgi_read_exact(client_fd, &hdr, sizeof(hdr)) == 0) {
+        int content_length = (hdr.contentLengthB1 << 8) | hdr.contentLengthB0;
+        request_id = (hdr.requestIdB1 << 8) | hdr.requestIdB0;
+
+        char *content = NULL;
+        if (content_length > 0) {
+            content = malloc(content_length);
+            if (fcgi_read_exact(client_fd, content, content_length) < 0) {
+                free(content);
+                break;
+            }
+        }
+
+        /* Skip padding */
+        if (hdr.paddingLength > 0) {
+            char pad[256];
+            if (fcgi_read_exact(client_fd, pad, hdr.paddingLength) < 0) {
+                free(content);
+                break;
+            }
+        }
+
+        switch (hdr.type) {
+            case FCGI_BEGIN_REQUEST:
+                params_buf_len = 0;
+                stdin_buf_len = 0;
+                params_done = 0;
+                stdin_done = 0;
+                if (content && content_length >= 3) {
+                    keep_conn = content[2] & 1;
+                }
+                break;
+
+            case FCGI_PARAMS:
+                if (content_length == 0) {
+                    params_done = 1;
+                } else {
+                    while (params_buf_len + content_length > params_buf_cap) {
+                        params_buf_cap = params_buf_cap ? params_buf_cap * 2 : 8192;
+                        params_buf = realloc(params_buf, params_buf_cap);
+                    }
+                    memcpy(params_buf + params_buf_len, content, content_length);
+                    params_buf_len += content_length;
+                }
+                break;
+
+            case FCGI_STDIN:
+                if (content_length == 0) {
+                    stdin_done = 1;
+                } else {
+                    while (stdin_buf_len + content_length > stdin_buf_cap) {
+                        stdin_buf_cap = stdin_buf_cap ? stdin_buf_cap * 2 : 8192;
+                        stdin_buf = realloc(stdin_buf, stdin_buf_cap);
+                    }
+                    memcpy(stdin_buf + stdin_buf_len, content, content_length);
+                    stdin_buf_len += content_length;
+                }
+                break;
+
+            case FCGI_ABORT_REQUEST:
+                free(content);
+                goto cleanup;
+        }
+
+        free(content);
+
+        /* Once we have all params and stdin, execute */
+        if (params_done && stdin_done) {
+            /* Decode params */
+            char *params[512];
+            int param_count = 0;
+            fcgi_decode_name_value(params_buf, params_buf_len, params, &param_count, 512);
+
+            /* Build request */
+            cgi_request req = {0};
+            req.params = params;
+            req.param_count = param_count;
+            req.body = stdin_buf;
+            req.body_len = stdin_buf_len;
+
+            const char *script_path = NULL;
+            for (int i = 0; i < param_count; i += 2) {
+                if (strcmp(params[i], "REQUEST_METHOD") == 0) req.method = params[i+1];
+                else if (strcmp(params[i], "REQUEST_URI") == 0) req.uri = params[i+1];
+                else if (strcmp(params[i], "QUERY_STRING") == 0) req.query_string = params[i+1];
+                else if (strcmp(params[i], "CONTENT_TYPE") == 0) req.content_type = params[i+1];
+                else if (strcmp(params[i], "CONTENT_LENGTH") == 0) req.content_length = params[i+1];
+                else if (strcmp(params[i], "HTTP_COOKIE") == 0) req.cookie = params[i+1];
+                else if (strcmp(params[i], "SCRIPT_FILENAME") == 0) script_path = params[i+1];
+                else if (strcmp(params[i], "PATH_TRANSLATED") == 0 && !script_path) script_path = params[i+1];
+            }
+
+            if (!script_path) {
+                const char *err = "Status: 500\r\nContent-Type: text/html\r\n\r\n"
+                                  "<h1>500</h1><p>No SCRIPT_FILENAME</p>";
+                fcgi_write_record(client_fd, FCGI_STDOUT, request_id, err, strlen(err));
+                fcgi_write_record(client_fd, FCGI_STDOUT, request_id, NULL, 0);
+                fcgi_write_end_request(client_fd, request_id, 1);
+            } else {
+                /* Set env vars for the engine */
+                for (int i = 0; i < param_count; i += 2) {
+                    setenv(params[i], params[i+1], 1);
+                }
+
+                /* Provide body via stdin pipe */
+                int body_pipe[2] = {-1, -1};
+                int saved_stdin = -1;
+                if (stdin_buf_len > 0) {
+                    pipe(body_pipe);
+                    (void)write(body_pipe[1], stdin_buf, stdin_buf_len);
+                    close(body_pipe[1]);
+                    saved_stdin = dup(STDIN_FILENO);
+                    dup2(body_pipe[0], STDIN_FILENO);
+                    close(body_pipe[0]);
+                }
+
+                /* Capture stdout */
+                int out_pipe[2];
+                pipe(out_pipe);
+                int saved_stdout = dup(STDOUT_FILENO);
+                dup2(out_pipe[1], STDOUT_FILENO);
+                close(out_pipe[1]);
+
+                execute_script(cfg, script_path, &req);
+                fflush(stdout);
+
+                /* Restore stdout */
+                dup2(saved_stdout, STDOUT_FILENO);
+                close(saved_stdout);
+
+                /* Restore stdin */
+                if (saved_stdin >= 0) {
+                    dup2(saved_stdin, STDIN_FILENO);
+                    close(saved_stdin);
+                }
+
+                /* Read captured output */
+                char out_buf[1048576];
+                size_t out_total = 0;
+                ssize_t nr;
+                while ((nr = read(out_pipe[0], out_buf + out_total,
+                                  sizeof(out_buf) - 1 - out_total)) > 0) {
+                    out_total += nr;
+                }
+                close(out_pipe[0]);
+
+                /* Send via FastCGI */
+                if (out_total > 0) {
+                    fcgi_write_record(client_fd, FCGI_STDOUT, request_id, out_buf, out_total);
+                }
+                fcgi_write_record(client_fd, FCGI_STDOUT, request_id, NULL, 0);
+                fcgi_write_end_request(client_fd, request_id, 0);
+
+                /* Clear env vars */
+                for (int i = 0; i < param_count; i += 2) {
+                    unsetenv(params[i]);
+                }
+            }
+
+            /* Free params */
+            for (int i = 0; i < param_count; i++) {
+                free(params[i]);
+            }
+
+            /* Reset for next request or close connection */
+            if (!keep_conn) goto cleanup;
+            params_buf_len = 0;
+            stdin_buf_len = 0;
+            params_done = 0;
+            stdin_done = 0;
+        }
+    }
+
+cleanup:
+    free(params_buf);
+    free(stdin_buf);
+    close(client_fd);
+}
+
+static int run_fastcgi(const char *addr, int num_workers, const char *ini_override) {
+    jscgi_config cfg;
+    config_load(&cfg, ini_override);
+    g_cfg = &cfg;
+
+    int server_fd;
+
+    /* Determine if addr is a Unix socket or TCP */
+    int is_unix = (addr[0] == '/' || addr[0] == '.');
+    struct sockaddr_in tcp_addr;
+
+    if (is_unix) {
+        struct sockaddr_un un_addr;
+        server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (server_fd < 0) {
+            fprintf(stderr, "Error: cannot create socket\n");
+            return 1;
+        }
+        memset(&un_addr, 0, sizeof(un_addr));
+        un_addr.sun_family = AF_UNIX;
+        strncpy(un_addr.sun_path, addr, sizeof(un_addr.sun_path) - 1);
+        unlink(addr);
+
+        if (bind(server_fd, (struct sockaddr *)&un_addr, sizeof(un_addr)) < 0) {
+            fprintf(stderr, "Error: cannot bind to %s — %s\n", addr, strerror(errno));
+            close(server_fd);
+            return 1;
+        }
+        chmod(addr, 0666);
+    } else {
+        server_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_fd < 0) {
+            fprintf(stderr, "Error: cannot create socket\n");
+            return 1;
+        }
+
+        int opt = 1;
+        setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        memset(&tcp_addr, 0, sizeof(tcp_addr));
+        tcp_addr.sin_family = AF_INET;
+
+        const char *colon = strchr(addr, ':');
+        if (colon) {
+            char host[256];
+            size_t hlen = colon - addr;
+            if (hlen >= sizeof(host)) hlen = sizeof(host) - 1;
+            memcpy(host, addr, hlen);
+            host[hlen] = '\0';
+            inet_pton(AF_INET, host, &tcp_addr.sin_addr);
+            tcp_addr.sin_port = htons(atoi(colon + 1));
+        } else {
+            tcp_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            tcp_addr.sin_port = htons(atoi(addr));
+        }
+
+        if (bind(server_fd, (struct sockaddr *)&tcp_addr, sizeof(tcp_addr)) < 0) {
+            fprintf(stderr, "Error: cannot bind to %s — %s\n", addr, strerror(errno));
+            close(server_fd);
+            return 1;
+        }
+    }
+
+    if (listen(server_fd, 128) < 0) {
+        fprintf(stderr, "Error: listen failed — %s\n", strerror(errno));
+        close(server_fd);
+        return 1;
+    }
+
+    fprintf(stderr, "js-cgi FastCGI server\n");
+    fprintf(stderr, "Listening on %s\n", addr);
+    fprintf(stderr, "Workers: %d\n\n", num_workers);
+
+    /* Pre-fork workers */
+    for (int i = 0; i < num_workers; i++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* Worker loop */
+            while (1) {
+                struct sockaddr_storage client_addr;
+                socklen_t client_len = sizeof(client_addr);
+                int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+                if (client_fd < 0) {
+                    if (errno == EINTR) continue;
+                    _exit(1);
+                }
+                fcgi_handle_connection(client_fd, &cfg);
+            }
+        } else if (pid < 0) {
+            fprintf(stderr, "Error: fork failed\n");
+        }
+    }
+
+    /* Master: wait for children, restart if they die */
+    struct sigaction sa;
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGCHLD, &sa, NULL);
+
+    while (1) {
+        int status;
+        pid_t died = waitpid(-1, &status, 0);
+        if (died < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        /* Restart worker */
+        pid_t pid = fork();
+        if (pid == 0) {
+            while (1) {
+                struct sockaddr_storage client_addr;
+                socklen_t client_len = sizeof(client_addr);
+                int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+                if (client_fd < 0) {
+                    if (errno == EINTR) continue;
+                    _exit(1);
+                }
+                fcgi_handle_connection(client_fd, &cfg);
+            }
+        }
+    }
+
+    close(server_fd);
+    if (is_unix) unlink(addr);
+
+    for (int i = 0; i < cfg.extension_count; i++) {
+        free(cfg.extensions[i]);
+    }
+    return 0;
+}
+
 /* -------------------- Development server -------------------- */
 
 static const char *mime_type_for(const char *path) {
@@ -1172,6 +1788,8 @@ int main(int argc, char **argv) {
     const char *ini_override = NULL;
     const char *script_path = NULL;
     const char *serve_arg = NULL;
+    const char *fastcgi_arg = NULL;
+    int num_workers = 4;
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
@@ -1179,6 +1797,10 @@ int main(int argc, char **argv) {
             ini_override = argv[i] + 6;
         } else if (strcmp(argv[i], "--serve") == 0) {
             serve_arg = (i + 1 < argc) ? argv[++i] : "8000";
+        } else if (strcmp(argv[i], "--fastcgi") == 0) {
+            fastcgi_arg = (i + 1 < argc) ? argv[++i] : "9000";
+        } else if (strcmp(argv[i], "--workers") == 0) {
+            if (i + 1 < argc) num_workers = atoi(argv[++i]);
         } else {
             script_path = argv[i];
         }
@@ -1219,6 +1841,13 @@ int main(int argc, char **argv) {
         return run_dev_server(host, port, doc_root, ini_override);
     }
 
+    /* FastCGI mode */
+    if (fastcgi_arg) {
+        if (num_workers < 1) num_workers = 1;
+        if (num_workers > 64) num_workers = 64;
+        return run_fastcgi(fastcgi_arg, num_workers, ini_override);
+    }
+
     /* In CGI mode, script path comes from environment.
        With Apache Action directive, PATH_TRANSLATED holds the actual file. */
     if (!script_path) {
@@ -1238,135 +1867,11 @@ int main(int argc, char **argv) {
     config_load(&cfg, ini_override);
     g_cfg = &cfg;
 
-    /* Read the script */
-    size_t script_len;
-    char *script = read_file(script_path, &script_len);
-    if (!script) {
-        output_error("Cannot read script file");
-        return 1;
-    }
-
-    /* Initialize response */
-    response_init();
-
-    /* Create QuickJS runtime */
-    JSRuntime *rt = JS_NewRuntime();
-    JS_SetMemoryLimit(rt, cfg.memory_limit);
-    JS_SetMaxStackSize(rt, 1024 * 1024);
-
-    /* Set up interrupt handler for time limit */
-    g_start_time = get_time_ms();
-    g_max_execution_time = cfg.max_execution_time;
-    JS_SetInterruptHandler(rt, interrupt_handler, NULL);
-
-    /* Create context */
-    JSContext *ctx = JS_NewContext(rt);
-
-    /* Set up globals */
-    JSValue global = JS_GetGlobalObject(ctx);
-
-    /* print() */
-    JS_SetPropertyStr(ctx, global, "print",
-        JS_NewCFunction(ctx, js_print, "print", 1));
-
-    /* include() */
-    JS_SetPropertyStr(ctx, global, "include",
-        JS_NewCFunction(ctx, js_include, "include", 1));
-
-    /* request */
-    JS_SetPropertyStr(ctx, global, "request", build_request_object(ctx));
-
-    /* response */
-    JS_SetPropertyStr(ctx, global, "response", build_response_object(ctx));
-
-    /* Load extensions */
-    load_extensions(&cfg, ctx, global);
-
-    JS_FreeValue(ctx, global);
-
-    /* Determine script directory for module resolution */
-    const char *last_slash = strrchr(script_path, '/');
-    if (last_slash) {
-        size_t dir_len = last_slash - script_path;
-        memcpy(g_script_dir, script_path, dir_len);
-        g_script_dir[dir_len] = '\0';
-    } else {
-        strcpy(g_script_dir, ".");
-    }
-
-    /* Register module loader */
-    JS_SetModuleLoaderFunc(rt, module_normalize, module_loader, NULL);
-
-    /* Detect module syntax */
-    int eval_flags = JS_EVAL_TYPE_GLOBAL;
-    if (strstr(script, "import ") || strstr(script, "export ")) {
-        eval_flags = JS_EVAL_TYPE_MODULE;
-    }
-
-    /* Execute script */
-    const char *filename = last_slash ? last_slash + 1 : script_path;
-
-    JSValue result = JS_Eval(ctx, script, script_len, filename, eval_flags);
-
-    /* Drain the job queue (resolves dynamic import() and other promises) */
-    if (!JS_IsException(result)) {
-        JSContext *ctx1;
-        int ret;
-        while ((ret = JS_ExecutePendingJob(rt, &ctx1)) > 0) {}
-        if (ret < 0) {
-            JS_FreeValue(ctx, result);
-            result = JS_EXCEPTION;
-        }
-    }
-
-    if (JS_IsException(result)) {
-        JSValue exc = JS_GetException(ctx);
-        const char *msg = JS_ToCString(ctx, exc);
-
-        /* Check for timeout */
-        uint64_t elapsed = get_time_ms() - g_start_time;
-        if (elapsed >= (uint64_t)g_max_execution_time * 1000) {
-            output_error("Maximum execution time exceeded");
-        } else {
-            char err_buf[4096];
-            const char *stack = NULL;
-            if (JS_IsObject(exc)) {
-                JSValue stack_val = JS_GetPropertyStr(ctx, exc, "stack");
-                if (JS_IsString(stack_val)) {
-                    stack = JS_ToCString(ctx, stack_val);
-                }
-                JS_FreeValue(ctx, stack_val);
-            }
-
-            if (msg && stack) {
-                snprintf(err_buf, sizeof(err_buf), "%s\n%s", msg, stack);
-            } else if (msg) {
-                snprintf(err_buf, sizeof(err_buf), "%s", msg);
-            } else {
-                snprintf(err_buf, sizeof(err_buf), "Unknown error");
-            }
-
-            output_error(err_buf);
-            if (stack) JS_FreeCString(ctx, stack);
-        }
-
-        if (msg) JS_FreeCString(ctx, msg);
-        JS_FreeValue(ctx, exc);
-    } else {
-        /* Output the response */
-        response_output();
-    }
-
-    JS_FreeValue(ctx, result);
-    unload_extensions();
-    JS_FreeContext(ctx);
-    JS_FreeRuntime(rt);
-    response_free();
-    free(script);
+    int ret = execute_script(&cfg, script_path, NULL);
 
     for (int i = 0; i < cfg.extension_count; i++) {
         free(cfg.extensions[i]);
     }
 
-    return 0;
+    return ret;
 }
