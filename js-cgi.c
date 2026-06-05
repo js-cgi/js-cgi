@@ -571,7 +571,16 @@ static char *module_normalize(JSContext *ctx, const char *module_base_name,
     if (module_name[0] == '/') {
         snprintf(tmp, sizeof(tmp), "%s", module_name);
     } else {
-        snprintf(tmp, sizeof(tmp), "%s/%s", g_script_dir, module_name);
+        char base_dir[4096];
+        const char *slash = strrchr(module_base_name, '/');
+        if (slash) {
+            size_t len = slash - module_base_name;
+            memcpy(base_dir, module_base_name, len);
+            base_dir[len] = '\0';
+        } else {
+            strcpy(base_dir, g_script_dir);
+        }
+        snprintf(tmp, sizeof(tmp), "%s/%s", base_dir, module_name);
     }
 
     /* Resolve the path to remove ./ and ../ */
@@ -831,6 +840,17 @@ int main(int argc, char **argv) {
     const char *filename = last_slash ? last_slash + 1 : script_path;
 
     JSValue result = JS_Eval(ctx, script, script_len, filename, eval_flags);
+
+    /* Drain the job queue (resolves dynamic import() and other promises) */
+    if (!JS_IsException(result)) {
+        JSContext *ctx1;
+        int ret;
+        while ((ret = JS_ExecutePendingJob(rt, &ctx1)) > 0) {}
+        if (ret < 0) {
+            JS_FreeValue(ctx, result);
+            result = JS_EXCEPTION;
+        }
+    }
 
     if (JS_IsException(result)) {
         JSValue exc = JS_GetException(ctx);
