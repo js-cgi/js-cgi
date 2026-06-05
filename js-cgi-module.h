@@ -124,7 +124,13 @@ extern void js_free(JSContext *ctx, void *ptr);
 extern JSValue JS_NewObject(JSContext *ctx);
 extern JSValue JS_NewArray(JSContext *ctx);
 extern JSValue JS_NewStringLen(JSContext *ctx, const char *str, size_t len);
-extern JSValue JS_NewCFunction(JSContext *ctx, JSCFunction *func, const char *name, int length);
+extern JSValue JS_NewCFunction2(JSContext *ctx, JSCFunction *func,
+                                const char *name, int length, int cproto, int magic);
+
+static inline JSValue JS_NewCFunction(JSContext *ctx, JSCFunction *func,
+                                      const char *name, int length) {
+    return JS_NewCFunction2(ctx, func, name, length, 0 /* JS_CFUNC_generic */, 0);
+}
 
 static inline JSValue JS_NewString(JSContext *ctx, const char *str) {
     size_t len = 0;
@@ -140,15 +146,37 @@ static inline JSValue JS_NewInt32(JSContext *ctx, int32_t val) {
     return JS_MKVAL(JS_TAG_INT, val);
 }
 
-extern JSValue JS_NewInt64(JSContext *ctx, int64_t val);
-extern JSValue JS_NewFloat64(JSContext *ctx, double val);
+static inline JSValue JS_NewFloat64(JSContext *ctx, double val) {
+    (void)ctx;
+#if INTPTR_MAX < INT64_MAX
+    union { double d; uint64_t u64; } u;
+    u.d = val;
+    return u.u64;
+#else
+    JSValue v;
+    v.tag = JS_TAG_FLOAT64;
+    v.u.float64 = val;
+    return v;
+#endif
+}
+
+static inline JSValue JS_NewInt64(JSContext *ctx, int64_t val) {
+    if (val >= INT32_MIN && val <= INT32_MAX) {
+        return JS_NewInt32(ctx, (int32_t)val);
+    } else {
+        return JS_NewFloat64(ctx, (double)val);
+    }
+}
 
 /* Value conversion */
-extern const char *JS_ToCString(JSContext *ctx, JSValueConst val);
 extern const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val, bool cesu8);
 extern int JS_ToInt32(JSContext *ctx, int32_t *pres, JSValueConst val);
 extern int JS_ToInt64(JSContext *ctx, int64_t *pres, JSValueConst val);
 extern int JS_ToFloat64(JSContext *ctx, double *pres, JSValueConst val);
+
+static inline const char *JS_ToCString(JSContext *ctx, JSValueConst val) {
+    return JS_ToCStringLen2(ctx, NULL, val, 0);
+}
 
 static inline const char *JS_ToCStringLen(JSContext *ctx, size_t *plen, JSValueConst val) {
     return JS_ToCStringLen2(ctx, plen, val, 0);
@@ -161,7 +189,11 @@ extern int JS_SetPropertyUint32(JSContext *ctx, JSValueConst this_obj, uint32_t 
 extern JSValue JS_GetPropertyUint32(JSContext *ctx, JSValueConst this_obj, uint32_t idx);
 extern JSValue JS_GetProperty(JSContext *ctx, JSValueConst this_obj, JSAtom prop);
 extern int JS_GetOwnPropertyNames(JSContext *ctx, JSPropertyEnum **ptab, uint32_t *plen, JSValueConst obj, int flags);
-extern const char *JS_AtomToCString(JSContext *ctx, JSAtom atom);
+extern const char *JS_AtomToCStringLen(JSContext *ctx, size_t *plen, JSAtom atom);
+
+static inline const char *JS_AtomToCString(JSContext *ctx, JSAtom atom) {
+    return JS_AtomToCStringLen(ctx, NULL, atom);
+}
 
 /* Arrays */
 extern bool JS_IsArray(JSValueConst val);
