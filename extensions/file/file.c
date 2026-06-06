@@ -6,6 +6,14 @@
 #include <unistd.h>
 #include <dirent.h>
 
+extern char g_script_dir[4096];
+
+static const char *resolve_path(const char *path, char *buf, size_t buf_size) {
+    if (path[0] == '/') return path;
+    snprintf(buf, buf_size, "%s/%s", g_script_dir, path);
+    return buf;
+}
+
 /* -------------------- JS API: file.read() -------------------- */
 
 static JSValue js_file_read(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -16,7 +24,10 @@ static JSValue js_file_read(JSContext *ctx, JSValueConst this_val, int argc, JSV
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) return JS_EXCEPTION;
 
-    FILE *fp = fopen(path, "rb");
+    char resolved[8192];
+    const char *full_path = resolve_path(path, resolved, sizeof(resolved));
+
+    FILE *fp = fopen(full_path, "rb");
     if (!fp) {
         JSValue err = JS_ThrowTypeError(ctx, "Cannot read file '%s'", path);
         JS_FreeCString(ctx, path);
@@ -48,6 +59,9 @@ static JSValue js_file_write(JSContext *ctx, JSValueConst this_val, int argc, JS
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) return JS_EXCEPTION;
 
+    char resolved[8192];
+    const char *full_path = resolve_path(path, resolved, sizeof(resolved));
+
     size_t content_len;
     const char *content = JS_ToCStringLen(ctx, &content_len, argv[1]);
     if (!content) {
@@ -55,7 +69,7 @@ static JSValue js_file_write(JSContext *ctx, JSValueConst this_val, int argc, JS
         return JS_EXCEPTION;
     }
 
-    FILE *fp = fopen(path, "wb");
+    FILE *fp = fopen(full_path, "wb");
     if (!fp) {
         JSValue err = JS_ThrowTypeError(ctx, "Cannot write to file '%s'", path);
         JS_FreeCString(ctx, path);
@@ -81,6 +95,9 @@ static JSValue js_file_append(JSContext *ctx, JSValueConst this_val, int argc, J
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) return JS_EXCEPTION;
 
+    char resolved[8192];
+    const char *full_path = resolve_path(path, resolved, sizeof(resolved));
+
     size_t content_len;
     const char *content = JS_ToCStringLen(ctx, &content_len, argv[1]);
     if (!content) {
@@ -88,7 +105,7 @@ static JSValue js_file_append(JSContext *ctx, JSValueConst this_val, int argc, J
         return JS_EXCEPTION;
     }
 
-    FILE *fp = fopen(path, "ab");
+    FILE *fp = fopen(full_path, "ab");
     if (!fp) {
         JSValue err = JS_ThrowTypeError(ctx, "Cannot append to file '%s'", path);
         JS_FreeCString(ctx, path);
@@ -114,8 +131,11 @@ static JSValue js_file_exists(JSContext *ctx, JSValueConst this_val, int argc, J
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) return JS_EXCEPTION;
 
+    char resolved[8192];
+    const char *full_path = resolve_path(path, resolved, sizeof(resolved));
+
     struct stat st;
-    int exists = (stat(path, &st) == 0);
+    int exists = (stat(full_path, &st) == 0);
     JS_FreeCString(ctx, path);
 
     return JS_NewBool(ctx, exists);
@@ -131,7 +151,10 @@ static JSValue js_file_delete(JSContext *ctx, JSValueConst this_val, int argc, J
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) return JS_EXCEPTION;
 
-    int result = unlink(path);
+    char resolved[8192];
+    const char *full_path = resolve_path(path, resolved, sizeof(resolved));
+
+    int result = unlink(full_path);
     JS_FreeCString(ctx, path);
 
     if (result != 0) {
@@ -151,8 +174,11 @@ static JSValue js_file_size(JSContext *ctx, JSValueConst this_val, int argc, JSV
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) return JS_EXCEPTION;
 
+    char resolved[8192];
+    const char *full_path = resolve_path(path, resolved, sizeof(resolved));
+
     struct stat st;
-    if (stat(path, &st) != 0) {
+    if (stat(full_path, &st) != 0) {
         JSValue err = JS_ThrowTypeError(ctx, "Cannot stat file '%s'", path);
         JS_FreeCString(ctx, path);
         return err;
@@ -172,8 +198,11 @@ static JSValue js_file_is_dir(JSContext *ctx, JSValueConst this_val, int argc, J
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) return JS_EXCEPTION;
 
+    char resolved[8192];
+    const char *full_path = resolve_path(path, resolved, sizeof(resolved));
+
     struct stat st;
-    int is_dir = (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
+    int is_dir = (stat(full_path, &st) == 0 && S_ISDIR(st.st_mode));
     JS_FreeCString(ctx, path);
 
     return JS_NewBool(ctx, is_dir);
@@ -189,7 +218,10 @@ static JSValue js_file_list(JSContext *ctx, JSValueConst this_val, int argc, JSV
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) return JS_EXCEPTION;
 
-    DIR *dir = opendir(path);
+    char resolved[8192];
+    const char *full_path = resolve_path(path, resolved, sizeof(resolved));
+
+    DIR *dir = opendir(full_path);
     if (!dir) {
         JSValue err = JS_ThrowTypeError(ctx, "Cannot open directory '%s'", path);
         JS_FreeCString(ctx, path);

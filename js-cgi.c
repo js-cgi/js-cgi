@@ -17,7 +17,7 @@
 #include "js-cgi-module.h"
 
 /* Forward declarations */
-static char g_script_dir[4096];
+char g_script_dir[4096];
 static char *read_file(const char *path, size_t *out_len);
 
 #define DEFAULT_MEMORY_LIMIT (128 * 1024 * 1024)
