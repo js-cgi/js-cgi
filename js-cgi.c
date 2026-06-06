@@ -1414,7 +1414,7 @@ static void serve_static(int client_fd, const char *path) {
     fclose(fp);
 }
 
-static void handle_request(int client_fd, const char *doc_root, const char *ini_override) {
+static void handle_request(int client_fd, const char *doc_root, const char *ini_override, const char *router) {
     char request_buf[65536];
     ssize_t total = 0;
     ssize_t n;
@@ -1471,10 +1471,14 @@ static void handle_request(int client_fd, const char *doc_root, const char *ini_
 
     /* Check if file exists */
     if (stat(file_path, &st) != 0) {
-        dprintf(client_fd, "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n"
-                "<h1>404 Not Found</h1><p>%s</p>\n", path);
-        fprintf(stderr, "[%s] 404 %s %s\n", method, path, "Not Found");
-        return;
+        if (router) {
+            snprintf(file_path, sizeof(file_path), "%s/%s", doc_root, router);
+        } else {
+            dprintf(client_fd, "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n"
+                    "<h1>404 Not Found</h1><p>%s</p>\n", path);
+            fprintf(stderr, "[%s] 404 %s %s\n", method, path, "Not Found");
+            return;
+        }
     }
 
     /* If not a .js file, serve static */
@@ -1717,7 +1721,7 @@ static void reap_children(int sig) {
     while (waitpid(-1, NULL, WNOHANG) > 0) {}
 }
 
-static int run_dev_server(const char *host, int port, const char *doc_root, const char *ini_override) {
+static int run_dev_server(const char *host, int port, const char *doc_root, const char *ini_override, const char *router) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         fprintf(stderr, "Error: cannot create socket\n");
@@ -1757,6 +1761,7 @@ static int run_dev_server(const char *host, int port, const char *doc_root, cons
     fprintf(stderr, "js-cgi development server\n");
     fprintf(stderr, "Listening on http://%s:%d\n", host, port);
     fprintf(stderr, "Document root: %s\n", doc_root);
+    if (router) fprintf(stderr, "Router: %s\n", router);
     fprintf(stderr, "Press Ctrl+C to stop.\n\n");
 
     while (1) {
@@ -1771,7 +1776,7 @@ static int run_dev_server(const char *host, int port, const char *doc_root, cons
         pid_t pid = fork();
         if (pid == 0) {
             close(server_fd);
-            handle_request(client_fd, doc_root, ini_override);
+            handle_request(client_fd, doc_root, ini_override, router);
             close(client_fd);
             _exit(0);
         }
@@ -1789,6 +1794,7 @@ int main(int argc, char **argv) {
     const char *script_path = NULL;
     const char *serve_arg = NULL;
     const char *fastcgi_arg = NULL;
+    const char *router_script = NULL;
     int num_workers = 4;
 
     /* Parse arguments */
@@ -1801,6 +1807,8 @@ int main(int argc, char **argv) {
             fastcgi_arg = (i + 1 < argc) ? argv[++i] : "9000";
         } else if (strcmp(argv[i], "--workers") == 0) {
             if (i + 1 < argc) num_workers = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--router") == 0) {
+            if (i + 1 < argc) router_script = argv[++i];
         } else {
             script_path = argv[i];
         }
@@ -1838,7 +1846,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        return run_dev_server(host, port, doc_root, ini_override);
+        return run_dev_server(host, port, doc_root, ini_override, router_script);
     }
 
     /* FastCGI mode */
