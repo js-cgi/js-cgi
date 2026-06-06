@@ -131,6 +131,9 @@ js-cgi --serve 8000 /path/to/project
 
 # With a custom ini file
 js-cgi --ini=/path/to/js-cgi.ini --serve 8000
+
+# With a router script (for MVC/front-controller apps)
+js-cgi --serve 8000 --router index.js
 ```
 
 The dev server:
@@ -139,6 +142,21 @@ The dev server:
 - Uses `index.js` as the directory index (falls back to `index.html`)
 - Forks per request (same isolation as production CGI)
 - Logs requests to the terminal
+
+### Router Script
+
+By default, the dev server returns 404 when no file matches the requested path. The `--router` flag specifies a fallback script that handles unmatched requests:
+
+```bash
+js-cgi --serve 8000 --router index.js
+```
+
+When `--router` is set:
+1. If the request matches a static file, it is served directly
+2. If the request matches a `.js` file, that file is executed
+3. Otherwise, the router script is executed with the original request URI available via `request.path`
+
+This is useful for applications that define their own URL routes in code rather than mapping URLs to individual files on disk. The router script receives the full request context (`request.method`, `request.path`, `request.query`, etc.) and is responsible for dispatching to the appropriate handler.
 
 ## FastCGI
 
