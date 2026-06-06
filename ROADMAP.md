@@ -6,15 +6,16 @@ Planned features and improvements for js-cgi.
 
 - **Built-in development server** — `js-cgi --serve [port]` for local development without Apache/Nginx
 - **FastCGI support** — `js-cgi --fastcgi [addr] --workers N` for persistent process mode
+- **MySQL extension** — `mysql.connect()` with parameterised queries, transactions, and connection pooling
 
 ## Upcoming
 
+- **PostgreSQL extension** — `pgsql.connect()` with the same API pattern as MySQL
 - **macOS support** — pre-built binaries for x86_64 and arm64
 - **Windows support** — pre-built binaries for x86_64
 
 ## Future Extensions
 
-- MySQL / PostgreSQL database extensions
 - Email (SMTP) extension
 - Image processing extension
 

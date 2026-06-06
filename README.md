@@ -45,6 +45,7 @@ See [ROADMAP.md](ROADMAP.md) for planned features including FastCGI support, a b
 - libsqlite3-dev (for sqlite extension)
 - libssl-dev (for crypto extension)
 - libcurl4-openssl-dev (for http extension)
+- libmysqlclient-dev (for mysql extension)
 
 ## Installation
 
@@ -360,6 +361,30 @@ http.delete(url, headers);
 
 All methods return `{ status, body, headers }`.
 
+### MySQL (mysql.so)
+
+MySQL database access with parameterised queries.
+
+```js
+const conn = mysql.connect("localhost", "user", "password", "database");
+// Optional 5th argument for port: mysql.connect("localhost", "user", "pass", "db", 3306);
+
+conn.exec("CREATE TABLE IF NOT EXISTS users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255))");
+conn.exec("INSERT INTO users (name) VALUES (?)", ["Alice"]);
+
+const users = conn.query("SELECT * FROM users");
+const user = conn.queryOne("SELECT * FROM users WHERE id = ?", [1]);
+
+conn.lastInsertId();      // Last auto-increment ID
+conn.changes();           // Rows affected by last statement
+
+conn.beginTransaction();
+conn.exec("INSERT INTO users (name) VALUES (?)", ["Bob"]);
+conn.commit();            // or conn.rollback()
+
+conn.close();
+```
+
 ## Configuration
 
 `/etc/js-cgi/js-cgi.ini`:
@@ -386,6 +411,7 @@ extension = sqlite.so
 extension = file.so
 extension = crypto.so
 extension = http.so
+extension = mysql.so
 ```
 
 ### INI load order
