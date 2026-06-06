@@ -4,6 +4,14 @@
 #include <string.h>
 #include <stdio.h>
 
+extern char g_script_dir[4096];
+
+static const char *resolve_path(const char *path, char *buf, size_t buf_size) {
+    if (path[0] == '/') return path;
+    snprintf(buf, buf_size, "%s/%s", g_script_dir, path);
+    return buf;
+}
+
 #define MAX_DBS 16
 
 static sqlite3 *g_dbs[MAX_DBS];
@@ -415,7 +423,10 @@ static JSValue js_sqlite_open(JSContext *ctx, JSValueConst this_val, int argc, J
     const char *path = JS_ToCString(ctx, argv[0]);
     if (!path) return JS_EXCEPTION;
 
-    int rc = sqlite3_open(path, &g_dbs[slot]);
+    char resolved[8192];
+    const char *full_path = resolve_path(path, resolved, sizeof(resolved));
+
+    int rc = sqlite3_open(full_path, &g_dbs[slot]);
     JS_FreeCString(ctx, path);
 
     if (rc != SQLITE_OK) {
