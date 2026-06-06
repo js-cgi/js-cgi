@@ -37,6 +37,8 @@ typedef struct {
     int extension_count;
     int display_errors;
     char error_log[4096];
+    size_t upload_max_filesize;
+    char upload_dir[4096];
 } jscgi_config;
 
 static void config_init(jscgi_config *cfg) {
@@ -46,6 +48,8 @@ static void config_init(jscgi_config *cfg) {
     cfg->extension_count = 0;
     cfg->display_errors = 1;
     cfg->error_log[0] = '\0';
+    cfg->upload_max_filesize = 2 * 1024 * 1024;
+    strcpy(cfg->upload_dir, "/tmp");
 }
 
 static size_t parse_memory_value(const char *val) {
@@ -113,6 +117,10 @@ static int config_load_file(jscgi_config *cfg, const char *path) {
             cfg->display_errors = (strcasecmp(val, "On") == 0 || strcmp(val, "1") == 0);
         } else if (strcmp(key, "error_log") == 0) {
             strncpy(cfg->error_log, val, sizeof(cfg->error_log) - 1);
+        } else if (strcmp(key, "upload_max_filesize") == 0) {
+            cfg->upload_max_filesize = parse_memory_value(val);
+        } else if (strcmp(key, "upload_dir") == 0) {
+            strncpy(cfg->upload_dir, val, sizeof(cfg->upload_dir) - 1);
         }
     }
 
@@ -251,6 +259,47 @@ static JSValue js_print(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     return JS_UNDEFINED;
 }
 
+/* -------------------- JS API: console -------------------- */
+
+static JSValue js_console_log(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    for (int i = 0; i < argc; i++) {
+        if (i > 0) fprintf(stderr, " ");
+        const char *str = JS_ToCString(ctx, argv[i]);
+        if (str) {
+            fprintf(stderr, "%s", str);
+            JS_FreeCString(ctx, str);
+        }
+    }
+    fprintf(stderr, "\n");
+    return JS_UNDEFINED;
+}
+
+/* -------------------- JS API: move() -------------------- */
+
+static JSValue js_move(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "move requires a source and destination path");
+    }
+
+    const char *src = JS_ToCString(ctx, argv[0]);
+    const char *dst = JS_ToCString(ctx, argv[1]);
+    if (!src || !dst) {
+        if (src) JS_FreeCString(ctx, src);
+        if (dst) JS_FreeCString(ctx, dst);
+        return JS_EXCEPTION;
+    }
+
+    int result = rename(src, dst);
+    JS_FreeCString(ctx, src);
+    JS_FreeCString(ctx, dst);
+
+    if (result != 0) {
+        return JS_ThrowTypeError(ctx, "move failed: %s", strerror(errno));
+    }
+
+    return JS_TRUE;
+}
+
 /* -------------------- JS API: include() -------------------- */
 
 static JSValue js_include(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -340,6 +389,30 @@ static JSValue js_response_set_status(JSContext *ctx, JSValueConst this_val, int
 
 /* -------------------- JS API: request -------------------- */
 
+static int hex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void url_decode(char *str) {
+    char *src = str;
+    char *dst = str;
+    while (*src) {
+        if (*src == '+') {
+            *dst++ = ' ';
+            src++;
+        } else if (*src == '%' && hex_digit(src[1]) >= 0 && hex_digit(src[2]) >= 0) {
+            *dst++ = (char)(hex_digit(src[1]) << 4 | hex_digit(src[2]));
+            src += 3;
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+}
+
 static void parse_query_string(JSContext *ctx, JSValue obj, const char *qs) {
     if (!qs || !*qs) return;
 
@@ -350,8 +423,11 @@ static void parse_query_string(JSContext *ctx, JSValue obj, const char *qs) {
         char *eq = strchr(pair, '=');
         if (eq) {
             *eq = '\0';
+            url_decode(pair);
+            url_decode(eq + 1);
             JS_SetPropertyStr(ctx, obj, pair, JS_NewString(ctx, eq + 1));
         } else {
+            url_decode(pair);
             JS_SetPropertyStr(ctx, obj, pair, JS_NewString(ctx, ""));
         }
         pair = strtok(NULL, "&");
@@ -407,7 +483,7 @@ static char *read_request_body(void) {
     return body;
 }
 
-static JSValue build_request_object(JSContext *ctx) {
+static JSValue build_request_object(JSContext *ctx, jscgi_config *cfg) {
     JSValue req = JS_NewObject(ctx);
 
     /* method */
@@ -448,7 +524,156 @@ static JSValue build_request_object(JSContext *ctx) {
 
     /* body */
     char *body = read_request_body();
-    JS_SetPropertyStr(ctx, req, "body", JS_NewString(ctx, body));
+    const char *ct = getenv("CONTENT_TYPE");
+
+    if (ct && strncmp(ct, "multipart/form-data", 19) == 0) {
+        /* Parse multipart form data */
+        const char *boundary_start = strstr(ct, "boundary=");
+        if (boundary_start) {
+            boundary_start += 9;
+            char boundary[256];
+            snprintf(boundary, sizeof(boundary), "--%s", boundary_start);
+            size_t boundary_len = strlen(boundary);
+
+            JSValue fields = JS_NewObject(ctx);
+            JSValue files = JS_NewObject(ctx);
+
+            const char *cl_str = getenv("CONTENT_LENGTH");
+            size_t body_len = cl_str ? atoi(cl_str) : strlen(body);
+            const char *pos = body;
+            const char *end = body + body_len;
+
+            while (pos < end) {
+                /* Find boundary */
+                const char *part_start = memmem(pos, end - pos, boundary, boundary_len);
+                if (!part_start) break;
+                part_start += boundary_len;
+
+                /* Check for final boundary (--) */
+                if (part_start[0] == '-' && part_start[1] == '-') break;
+
+                /* Skip CRLF after boundary */
+                if (part_start[0] == '\r') part_start++;
+                if (part_start[0] == '\n') part_start++;
+
+                /* Find end of this part */
+                const char *part_end = memmem(part_start, end - part_start, boundary, boundary_len);
+                if (!part_end) break;
+
+                /* Remove trailing CRLF before next boundary */
+                const char *data_end = part_end;
+                if (data_end > part_start && data_end[-1] == '\n') data_end--;
+                if (data_end > part_start && data_end[-1] == '\r') data_end--;
+
+                /* Parse part headers */
+                const char *headers_end = memmem(part_start, data_end - part_start, "\r\n\r\n", 4);
+                if (!headers_end) { pos = part_end; continue; }
+
+                size_t hdr_len = headers_end - part_start;
+                const char *data_start = headers_end + 4;
+
+                /* Extract name and filename from Content-Disposition */
+                char field_name[256] = {0};
+                char file_name[256] = {0};
+                char part_ct[256] = {0};
+
+                /* Search headers for Content-Disposition and Content-Type */
+                const char *h = part_start;
+                while (h < headers_end) {
+                    const char *line_end = memmem(h, headers_end - h, "\r\n", 2);
+                    if (!line_end) line_end = headers_end;
+
+                    if (strncasecmp(h, "Content-Disposition:", 20) == 0) {
+                        const char *name_pos = strstr(h, "name=\"");
+                        if (name_pos && name_pos < line_end) {
+                            name_pos += 6;
+                            const char *name_end = strchr(name_pos, '"');
+                            if (name_end && name_end < line_end) {
+                                size_t nlen = name_end - name_pos;
+                                if (nlen >= sizeof(field_name)) nlen = sizeof(field_name) - 1;
+                                memcpy(field_name, name_pos, nlen);
+                                field_name[nlen] = '\0';
+                            }
+                        }
+                        const char *fn_pos = strstr(h, "filename=\"");
+                        if (fn_pos && fn_pos < line_end) {
+                            fn_pos += 10;
+                            const char *fn_end = strchr(fn_pos, '"');
+                            if (fn_end && fn_end < line_end) {
+                                size_t fnlen = fn_end - fn_pos;
+                                if (fnlen >= sizeof(file_name)) fnlen = sizeof(file_name) - 1;
+                                memcpy(file_name, fn_pos, fnlen);
+                                file_name[fnlen] = '\0';
+                            }
+                        }
+                    } else if (strncasecmp(h, "Content-Type:", 13) == 0) {
+                        const char *ct_val = h + 13;
+                        while (*ct_val == ' ') ct_val++;
+                        size_t ct_len = line_end - ct_val;
+                        if (ct_len >= sizeof(part_ct)) ct_len = sizeof(part_ct) - 1;
+                        memcpy(part_ct, ct_val, ct_len);
+                        part_ct[ct_len] = '\0';
+                    }
+
+                    h = line_end + 2;
+                }
+
+                size_t data_len = data_end - data_start;
+
+                if (field_name[0]) {
+                    if (file_name[0]) {
+                        /* File upload */
+                        if (data_len > cfg->upload_max_filesize) {
+                            JSValue file_obj = JS_NewObject(ctx);
+                            JS_SetPropertyStr(ctx, file_obj, "filename", JS_NewString(ctx, file_name));
+                            JS_SetPropertyStr(ctx, file_obj, "error", JS_NewString(ctx, "File exceeds upload_max_filesize"));
+                            JS_SetPropertyStr(ctx, file_obj, "size", JS_NewInt64(ctx, data_len));
+                            JS_SetPropertyStr(ctx, files, field_name, file_obj);
+                        } else {
+                            char tmp_path[4352];
+                            snprintf(tmp_path, sizeof(tmp_path), "%s/jscgi_upload_%d_%s", cfg->upload_dir, getpid(), file_name);
+                            FILE *tmp_fp = fopen(tmp_path, "wb");
+                            if (tmp_fp) {
+                                fwrite(data_start, 1, data_len, tmp_fp);
+                                fclose(tmp_fp);
+                                JSValue file_obj = JS_NewObject(ctx);
+                                JS_SetPropertyStr(ctx, file_obj, "filename", JS_NewString(ctx, file_name));
+                                JS_SetPropertyStr(ctx, file_obj, "contentType", JS_NewString(ctx, part_ct[0] ? part_ct : "application/octet-stream"));
+                                JS_SetPropertyStr(ctx, file_obj, "tmpPath", JS_NewString(ctx, tmp_path));
+                                JS_SetPropertyStr(ctx, file_obj, "size", JS_NewInt64(ctx, data_len));
+                                JS_SetPropertyStr(ctx, files, field_name, file_obj);
+                            } else {
+                                JSValue file_obj = JS_NewObject(ctx);
+                                JS_SetPropertyStr(ctx, file_obj, "filename", JS_NewString(ctx, file_name));
+                                JS_SetPropertyStr(ctx, file_obj, "error", JS_NewString(ctx, "Failed to write temp file"));
+                                JS_SetPropertyStr(ctx, files, field_name, file_obj);
+                            }
+                        }
+                    } else {
+                        /* Regular field */
+                        JS_SetPropertyStr(ctx, fields, field_name, JS_NewStringLen(ctx, data_start, data_len));
+                    }
+                }
+
+                pos = part_end;
+            }
+
+            JS_SetPropertyStr(ctx, req, "body", fields);
+            JS_SetPropertyStr(ctx, req, "files", files);
+        } else {
+            JS_SetPropertyStr(ctx, req, "body", JS_NewString(ctx, body));
+            JS_SetPropertyStr(ctx, req, "files", JS_NewObject(ctx));
+        }
+    } else if (ct && strncmp(ct, "application/x-www-form-urlencoded", 33) == 0) {
+        /* Parse URL-encoded form body into an object */
+        JSValue fields = JS_NewObject(ctx);
+        parse_query_string(ctx, fields, body);
+        JS_SetPropertyStr(ctx, req, "body", fields);
+        JS_SetPropertyStr(ctx, req, "files", JS_NewObject(ctx));
+    } else {
+        JS_SetPropertyStr(ctx, req, "body", JS_NewString(ctx, body));
+        JS_SetPropertyStr(ctx, req, "files", JS_NewObject(ctx));
+    }
     free(body);
 
     /* cookies */
@@ -462,6 +687,7 @@ static JSValue build_request_object(JSContext *ctx) {
             char *eq = strchr(pair, '=');
             if (eq) {
                 *eq = '\0';
+                url_decode(eq + 1);
                 JS_SetPropertyStr(ctx, cookies, pair, JS_NewString(ctx, eq + 1));
             }
             pair = strtok(NULL, ";");
@@ -818,7 +1044,21 @@ static int execute_script(jscgi_config *cfg, const char *script_path, cgi_reques
         JS_NewCFunction(ctx, js_print, "print", 1));
     JS_SetPropertyStr(ctx, global, "include",
         JS_NewCFunction(ctx, js_include, "include", 1));
-    JS_SetPropertyStr(ctx, global, "request", build_request_object(ctx));
+    JS_SetPropertyStr(ctx, global, "move",
+        JS_NewCFunction(ctx, js_move, "move", 2));
+
+    JSValue console_obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, console_obj, "log",
+        JS_NewCFunction(ctx, js_console_log, "log", 1));
+    JS_SetPropertyStr(ctx, console_obj, "error",
+        JS_NewCFunction(ctx, js_console_log, "error", 1));
+    JS_SetPropertyStr(ctx, console_obj, "warn",
+        JS_NewCFunction(ctx, js_console_log, "warn", 1));
+    JS_SetPropertyStr(ctx, console_obj, "info",
+        JS_NewCFunction(ctx, js_console_log, "info", 1));
+    JS_SetPropertyStr(ctx, global, "console", console_obj);
+
+    JS_SetPropertyStr(ctx, global, "request", build_request_object(ctx, cfg));
     JS_SetPropertyStr(ctx, global, "response", build_response_object(ctx));
 
     load_extensions(cfg, ctx, global);
@@ -836,10 +1076,19 @@ static int execute_script(jscgi_config *cfg, const char *script_path, cgi_reques
 
     JS_SetModuleLoaderFunc(rt, module_normalize, module_loader, NULL);
 
-    /* Detect module syntax */
+    /* Detect module syntax — only match import/export at the start of a line */
     int eval_flags = JS_EVAL_TYPE_GLOBAL;
-    if (strstr(script, "import ") || strstr(script, "export ")) {
-        eval_flags = JS_EVAL_TYPE_MODULE;
+    const char *p = script;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if ((strncmp(p, "import ", 7) == 0 || strncmp(p, "import{", 7) == 0 ||
+             strncmp(p, "export ", 7) == 0 || strncmp(p, "export{", 7) == 0 ||
+             strncmp(p, "export;", 7) == 0)) {
+            eval_flags = JS_EVAL_TYPE_MODULE;
+            break;
+        }
+        while (*p && *p != '\n') p++;
+        if (*p) p++;
     }
 
     /* Execute script */

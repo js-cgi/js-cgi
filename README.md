@@ -217,10 +217,22 @@ server {
 | `request.method` | HTTP method (GET, POST, etc.) |
 | `request.uri` | Full request URI including query string |
 | `request.path` | Path without query string |
-| `request.query` | Parsed query string as object |
+| `request.query` | Parsed query string as object (URL-decoded) |
 | `request.headers` | Request headers as object (lowercase keys) |
-| `request.body` | Request body as string |
-| `request.cookies` | Parsed cookies as object |
+| `request.body` | Request body — string for JSON/text, object for form submissions |
+| `request.cookies` | Parsed cookies as object (URL-decoded) |
+| `request.files` | Uploaded files (multipart/form-data only) |
+
+For `multipart/form-data` submissions, `request.body` contains the form fields as an object and `request.files` contains uploaded files:
+
+```js
+// request.files.avatar:
+// { filename: "photo.jpg", contentType: "image/jpeg", tmpPath: "/tmp/jscgi_upload_...", size: 12345 }
+
+move(request.files.avatar.tmpPath, "./uploads/photo.jpg");
+```
+
+Files exceeding `upload_max_filesize` will have an `error` property instead of `tmpPath`.
 
 ### response
 
@@ -254,6 +266,25 @@ include("./footer.js");
 ```
 
 Resolves paths relative to the current script. Included files share the same context.
+
+### move()
+
+```js
+move("/tmp/uploaded_file.jpg", "./uploads/photo.jpg");
+```
+
+Moves a file from source to destination. Returns `true` on success, throws on failure. Primarily used for moving uploaded files from their temp location to a permanent path.
+
+### console
+
+```js
+console.log("debug info");
+console.error("something went wrong");
+console.warn("warning");
+console.info("info");
+```
+
+Writes to stderr (appears in the web server error log, or in the terminal when using `--serve`). Does not write to the response body.
 
 ## ES Modules
 
@@ -404,6 +435,12 @@ error_log = /var/log/js-cgi/error.log
 
 # Directory where extensions are loaded from
 extension_dir = /usr/lib/js-cgi/modules
+
+# Maximum upload file size (supports K, M, G suffixes)
+upload_max_filesize = 2M
+
+# Directory for temporary upload files
+upload_dir = /tmp
 
 # Load extensions
 extension = session.so
