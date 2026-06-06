@@ -26,6 +26,24 @@ static char *read_file(const char *path, size_t *out_len);
 #define INI_SYSTEM_PATH "/etc/js-cgi/js-cgi.ini"
 #define INI_MAX_LINE 1024
 #define MAX_EXTENSIONS 64
+#define MAX_TEMP_FILES 64
+
+static char *g_temp_files[MAX_TEMP_FILES];
+static int g_temp_file_count = 0;
+
+static void track_temp_file(const char *path) {
+    if (g_temp_file_count < MAX_TEMP_FILES) {
+        g_temp_files[g_temp_file_count++] = strdup(path);
+    }
+}
+
+static void cleanup_temp_files(void) {
+    for (int i = 0; i < g_temp_file_count; i++) {
+        unlink(g_temp_files[i]);
+        free(g_temp_files[i]);
+    }
+    g_temp_file_count = 0;
+}
 
 /* -------------------- Configuration -------------------- */
 
@@ -214,6 +232,9 @@ static void response_output(void) {
     if (!g_response.content_type_set) {
         printf("Content-Type: %s\r\n", DEFAULT_CONTENT_TYPE);
     }
+
+    /* Content-Length */
+    printf("Content-Length: %zu\r\n", g_response.body_len);
 
     /* Custom headers */
     if (g_response.headers_len > 0) {
@@ -630,12 +651,25 @@ static JSValue build_request_object(JSContext *ctx, jscgi_config *cfg) {
                             JS_SetPropertyStr(ctx, file_obj, "size", JS_NewInt64(ctx, data_len));
                             JS_SetPropertyStr(ctx, files, field_name, file_obj);
                         } else {
+                            /* Generate random temp filename */
+                            unsigned char rand_bytes[8];
+                            FILE *urand = fopen("/dev/urandom", "rb");
+                            if (urand) {
+                                fread(rand_bytes, 1, 8, urand);
+                                fclose(urand);
+                            } else {
+                                for (int r = 0; r < 8; r++) rand_bytes[r] = (unsigned char)(getpid() + r * 37);
+                            }
+                            char rand_hex[17];
+                            for (int r = 0; r < 8; r++) snprintf(rand_hex + r * 2, 3, "%02x", rand_bytes[r]);
+
                             char tmp_path[4352];
-                            snprintf(tmp_path, sizeof(tmp_path), "%s/jscgi_upload_%d_%s", cfg->upload_dir, getpid(), file_name);
+                            snprintf(tmp_path, sizeof(tmp_path), "%s/jscgi_%s", cfg->upload_dir, rand_hex);
                             FILE *tmp_fp = fopen(tmp_path, "wb");
                             if (tmp_fp) {
                                 fwrite(data_start, 1, data_len, tmp_fp);
                                 fclose(tmp_fp);
+                                track_temp_file(tmp_path);
                                 JSValue file_obj = JS_NewObject(ctx);
                                 JS_SetPropertyStr(ctx, file_obj, "filename", JS_NewString(ctx, file_name));
                                 JS_SetPropertyStr(ctx, file_obj, "contentType", JS_NewString(ctx, part_ct[0] ? part_ct : "application/octet-stream"));
@@ -1149,6 +1183,7 @@ static int execute_script(jscgi_config *cfg, const char *script_path, cgi_reques
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     response_free();
+    cleanup_temp_files();
     free(script);
 
     return success ? 0 : 1;
