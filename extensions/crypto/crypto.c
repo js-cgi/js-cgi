@@ -149,6 +149,72 @@ static JSValue js_crypto_hmac(JSContext *ctx, JSValueConst this_val, int argc, J
     return JS_NewString(ctx, hex);
 }
 
+/* -------------------- JS API: crypto.hmacHex() -------------------- */
+
+static int hex_char_to_int(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static JSValue js_crypto_hmac_hex(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 3) return JS_ThrowTypeError(ctx, "crypto.hmacHex requires algorithm, hexKey, and data");
+
+    const char *algo = JS_ToCString(ctx, argv[0]);
+    if (!algo) return JS_EXCEPTION;
+
+    const char *hex_key = JS_ToCString(ctx, argv[1]);
+    if (!hex_key) { JS_FreeCString(ctx, algo); return JS_EXCEPTION; }
+
+    size_t data_len;
+    const char *data = JS_ToCStringLen(ctx, &data_len, argv[2]);
+    if (!data) { JS_FreeCString(ctx, algo); JS_FreeCString(ctx, hex_key); return JS_EXCEPTION; }
+
+    const EVP_MD *md = NULL;
+    if (strcasecmp(algo, "sha256") == 0) md = EVP_sha256();
+    else if (strcasecmp(algo, "sha1") == 0) md = EVP_sha1();
+    else if (strcasecmp(algo, "sha512") == 0) md = EVP_sha512();
+    else if (strcasecmp(algo, "md5") == 0) md = EVP_md5();
+
+    JS_FreeCString(ctx, algo);
+
+    if (!md) {
+        JS_FreeCString(ctx, hex_key);
+        JS_FreeCString(ctx, data);
+        return JS_ThrowTypeError(ctx, "Unsupported algorithm. Use: md5, sha1, sha256, sha512");
+    }
+
+    size_t hex_len = strlen(hex_key);
+    size_t key_len = hex_len / 2;
+    unsigned char *key_bytes = malloc(key_len);
+
+    for (size_t i = 0; i < key_len; i++) {
+        int hi = hex_char_to_int(hex_key[i * 2]);
+        int lo = hex_char_to_int(hex_key[i * 2 + 1]);
+        if (hi < 0 || lo < 0) {
+            free(key_bytes);
+            JS_FreeCString(ctx, hex_key);
+            JS_FreeCString(ctx, data);
+            return JS_ThrowTypeError(ctx, "Invalid hex character in key");
+        }
+        key_bytes[i] = (unsigned char)((hi << 4) | lo);
+    }
+
+    JS_FreeCString(ctx, hex_key);
+
+    unsigned char hash[EVP_MAX_MD_SIZE];
+    unsigned int hash_len;
+    HMAC(md, key_bytes, key_len, (unsigned char *)data, data_len, hash, &hash_len);
+
+    free(key_bytes);
+    JS_FreeCString(ctx, data);
+
+    char hex[129];
+    bytes_to_hex(hash, hash_len, hex);
+    return JS_NewString(ctx, hex);
+}
+
 /* -------------------- JS API: crypto.randomBytes() -------------------- */
 
 static JSValue js_crypto_random_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -208,6 +274,8 @@ static int crypto_init(JSContext *ctx, JSValue global) {
         JS_NewCFunction(ctx, js_crypto_sha512, "sha512", 1));
     JS_SetPropertyStr(ctx, crypto_obj, "hmac",
         JS_NewCFunction(ctx, js_crypto_hmac, "hmac", 3));
+    JS_SetPropertyStr(ctx, crypto_obj, "hmacHex",
+        JS_NewCFunction(ctx, js_crypto_hmac_hex, "hmacHex", 3));
     JS_SetPropertyStr(ctx, crypto_obj, "randomBytes",
         JS_NewCFunction(ctx, js_crypto_random_bytes, "randomBytes", 1));
     JS_SetPropertyStr(ctx, crypto_obj, "uuid",
