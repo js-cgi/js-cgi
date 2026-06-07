@@ -20,7 +20,7 @@
 char g_script_dir[4096];
 static char *read_file(const char *path, size_t *out_len);
 
-#define JSCGI_VERSION "0.1.1"
+#define JSCGI_VERSION "0.1.2"
 #define DEFAULT_MEMORY_LIMIT (128 * 1024 * 1024)
 #define DEFAULT_MAX_EXECUTION_TIME 30
 #define DEFAULT_CONTENT_TYPE "text/html"
