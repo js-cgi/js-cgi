@@ -34,6 +34,7 @@ jobs:
           gcc -shared -fPIC -O2 -I. -o extensions/session/session.so extensions/session/session.c
           gcc -shared -fPIC -O2 -I. -o extensions/file/file.so extensions/file/file.c
           gcc -shared -fPIC -O2 -I. -I/usr/include/mysql -o extensions/mysql/mysql.so extensions/mysql/mysql.c -lmysqlclient
+          gcc -shared -fPIC -O2 -I. -o extensions/smtp/smtp.so extensions/smtp/smtp.c -lssl -lcrypto
 
       - name: Package
         run: |
@@ -45,6 +46,7 @@ jobs:
           cp extensions/session/session.so dist/js-cgi/modules/
           cp extensions/file/file.so dist/js-cgi/modules/
           cp extensions/mysql/mysql.so dist/js-cgi/modules/
+          cp extensions/smtp/smtp.so dist/js-cgi/modules/
           cp js-cgi.ini dist/js-cgi/
           cp js-cgi-module.h dist/js-cgi/
           cd dist && tar -czf js-cgi-linux-x86_64.tar.gz js-cgi/
@@ -80,6 +82,7 @@ jobs:
           gcc -shared -fPIC -O2 -I. -o extensions/session/session.so extensions/session/session.c
           gcc -shared -fPIC -O2 -I. -o extensions/file/file.so extensions/file/file.c
           gcc -shared -fPIC -O2 -I. -I/usr/include/mysql -o extensions/mysql/mysql.so extensions/mysql/mysql.c -lmysqlclient
+          gcc -shared -fPIC -O2 -I. -o extensions/smtp/smtp.so extensions/smtp/smtp.c -lssl -lcrypto
 
       - name: Package
         run: |
@@ -91,6 +94,7 @@ jobs:
           cp extensions/session/session.so dist/js-cgi/modules/
           cp extensions/file/file.so dist/js-cgi/modules/
           cp extensions/mysql/mysql.so dist/js-cgi/modules/
+          cp extensions/smtp/smtp.so dist/js-cgi/modules/
           cp js-cgi.ini dist/js-cgi/
           cp js-cgi-module.h dist/js-cgi/
           cd dist && tar -czf js-cgi-linux-arm64.tar.gz js-cgi/
