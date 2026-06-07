@@ -4,7 +4,7 @@ A lightweight JavaScript CGI engine. Run modern JavaScript on your web server �
 
 Full ES2023+ JavaScript support. No Node.js required.
 
-**Website:** [js-cgi.com](https://js-cgi.com) — documentation, downloads, and examples. The site itself is built with and powered by js-cgi v0.1.0.
+**Website:** [js-cgi.com](https://js-cgi.com) — documentation, downloads, and examples. The site itself is built with and powered by js-cgi.
 
 ## About
 
@@ -275,6 +275,22 @@ move("/tmp/uploaded_file.jpg", "./uploads/photo.jpg");
 
 Moves a file from source to destination. Returns `true` on success, throws on failure. Primarily used for moving uploaded files from their temp location to a permanent path.
 
+### argv
+
+When running a script from the command line, any arguments after the script path are available as the global `argv` array:
+
+```bash
+js-cgi myscript.js migrate --verbose
+```
+
+```js
+// myscript.js
+argv[0]  // "migrate"
+argv[1]  // "--verbose"
+```
+
+`argv` is always an array — it will be empty if no arguments are passed. js-cgi's own flags (`--serve`, `--ini=`, etc.) are consumed before the script runs and do not appear in `argv`.
+
 ### console
 
 ```js
@@ -303,6 +319,27 @@ export function greet(name) {
     return `Hello, ${name}!`;
 }
 ```
+
+### Dynamic import
+
+Dynamic `import()` is supported and returns a promise. Use it to load modules at runtime when the path isn't known at parse time:
+
+```js
+import("./plugins/" + name + ".js").then(mod => {
+    mod.run();
+});
+```
+
+Or with `await` (available at the top level when the script is already a module — i.e. it contains at least one static `import` statement):
+
+```js
+import { something } from "./app.js";
+
+const mod = await import("./plugins/" + name + ".js");
+mod.run();
+```
+
+A script becomes a module when it contains any `import` or `export` statement. Scripts without these are evaluated as plain scripts where top-level `await` is not available.
 
 ## Extensions
 

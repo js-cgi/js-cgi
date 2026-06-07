@@ -12,7 +12,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#define JSCGI_MODULE_VERSION "0.1.0"
+#define JSCGI_MODULE_VERSION "0.1.1"
 
 /*
  * If QuickJS is already included (building js-cgi itself), skip

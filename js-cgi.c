@@ -20,6 +20,7 @@
 char g_script_dir[4096];
 static char *read_file(const char *path, size_t *out_len);
 
+#define JSCGI_VERSION "0.1.1"
 #define DEFAULT_MEMORY_LIMIT (128 * 1024 * 1024)
 #define DEFAULT_MAX_EXECUTION_TIME 30
 #define DEFAULT_CONTENT_TYPE "text/html"
@@ -1000,14 +1001,14 @@ static void output_error(const char *msg) {
         printf("<h1>Internal Server Error</h1>\n");
         printf("<p>The server encountered an internal error and was unable to complete your request.</p>\n");
         printf("<hr>\n");
-        printf("<address>js-cgi/" CONFIG_VERSION "</address>\n");
+        printf("<address>js-cgi/" JSCGI_VERSION "</address>\n");
         printf("</body>\n</html>\n");
     } else {
         printf("<!DOCTYPE html>\n<html>\n<head><title>500 Internal Server Error</title></head>\n<body>\n");
         printf("<h1>Internal Server Error</h1>\n");
         printf("<pre>%s</pre>\n", msg);
         printf("<hr>\n");
-        printf("<address>js-cgi/" CONFIG_VERSION "</address>\n");
+        printf("<address>js-cgi/" JSCGI_VERSION "</address>\n");
         printf("</body>\n</html>\n");
     }
 }
@@ -1029,7 +1030,7 @@ typedef struct {
     int param_count;
 } cgi_request;
 
-static int execute_script(jscgi_config *cfg, const char *script_path, cgi_request *req) {
+static int execute_script(jscgi_config *cfg, const char *script_path, cgi_request *req, int script_argc, char **script_argv) {
     /* Read the script */
     size_t script_len;
     char *script = read_file(script_path, &script_len);
@@ -1094,6 +1095,13 @@ static int execute_script(jscgi_config *cfg, const char *script_path, cgi_reques
 
     JS_SetPropertyStr(ctx, global, "request", build_request_object(ctx, cfg));
     JS_SetPropertyStr(ctx, global, "response", build_response_object(ctx));
+
+    /* Expose script arguments as global argv array */
+    JSValue argv_array = JS_NewArray(ctx);
+    for (int i = 0; i < script_argc; i++) {
+        JS_SetPropertyUint32(ctx, argv_array, i, JS_NewString(ctx, script_argv[i]));
+    }
+    JS_SetPropertyStr(ctx, global, "argv", argv_array);
 
     load_extensions(cfg, ctx, global);
     JS_FreeValue(ctx, global);
@@ -1463,7 +1471,7 @@ static void fcgi_handle_connection(int client_fd, jscgi_config *cfg) {
                 dup2(out_pipe[1], STDOUT_FILENO);
                 close(out_pipe[1]);
 
-                execute_script(cfg, script_path, &req);
+                execute_script(cfg, script_path, &req, 0, NULL);
                 fflush(stdout);
 
                 /* Restore stdout */
@@ -2080,11 +2088,28 @@ int main(int argc, char **argv) {
     const char *fastcgi_arg = NULL;
     const char *router_script = NULL;
     int num_workers = 4;
+    int script_argc = 0;
+    char **script_argv = NULL;
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--ini=", 6) == 0) {
             ini_override = argv[i] + 6;
+        } else if (strcmp(argv[i], "--help") == 0) {
+            printf("js-cgi %s\n\n", JSCGI_VERSION);
+            printf("Usage: js-cgi [options] <script.js> [script args...]\n\n");
+            printf("Options:\n");
+            printf("  --serve [host:]port  Start development server (default: 8000)\n");
+            printf("  --fastcgi [port]     Start FastCGI server (default: 9000)\n");
+            printf("  --workers N          Number of FastCGI workers (default: 4)\n");
+            printf("  --router script.js   Route all unmatched requests to this script\n");
+            printf("  --ini=path           Load configuration from specified ini file\n");
+            printf("  --help               Show this help message\n");
+            printf("  --version            Show version number\n");
+            return 0;
+        } else if (strcmp(argv[i], "--version") == 0) {
+            printf("%s\n", JSCGI_VERSION);
+            return 0;
         } else if (strcmp(argv[i], "--serve") == 0) {
             serve_arg = (i + 1 < argc) ? argv[++i] : "8000";
         } else if (strcmp(argv[i], "--fastcgi") == 0) {
@@ -2095,6 +2120,9 @@ int main(int argc, char **argv) {
             if (i + 1 < argc) router_script = argv[++i];
         } else {
             script_path = argv[i];
+            script_argc = argc - i - 1;
+            script_argv = (script_argc > 0) ? &argv[i + 1] : NULL;
+            break;
         }
     }
 
@@ -2159,7 +2187,7 @@ int main(int argc, char **argv) {
     config_load(&cfg, ini_override);
     g_cfg = &cfg;
 
-    int ret = execute_script(&cfg, script_path, NULL);
+    int ret = execute_script(&cfg, script_path, NULL, script_argc, script_argv);
 
     for (int i = 0; i < cfg.extension_count; i++) {
         free(cfg.extensions[i]);
