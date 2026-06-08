@@ -185,6 +185,7 @@ typedef struct {
 } jscgi_response;
 
 static jscgi_response g_response;
+static int g_cli_mode = 0;
 
 static void response_init(void) {
     g_response.headers = malloc(4096);
@@ -226,6 +227,13 @@ static void response_append_body(const char *data, size_t len) {
 }
 
 static void response_output(void) {
+    if (g_cli_mode) {
+        if (g_response.body_len > 0) {
+            fwrite(g_response.body, 1, g_response.body_len, stdout);
+        }
+        return;
+    }
+
     /* Status line */
     printf("Status: %d\r\n", g_response.status);
 
@@ -2180,6 +2188,11 @@ int main(int argc, char **argv) {
     if (!script_path) {
         output_error("No script specified");
         return 1;
+    }
+
+    /* CLI mode: running directly from command line, not via web server */
+    if (!getenv("REQUEST_METHOD")) {
+        g_cli_mode = 1;
     }
 
     /* Load configuration */
