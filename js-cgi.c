@@ -320,6 +320,25 @@ static JSValue js_move(JSContext *ctx, JSValueConst this_val, int argc, JSValueC
     }
 
     int result = rename(src, dst);
+    if (result != 0 && errno == EXDEV) {
+        FILE *in = fopen(src, "rb");
+        if (in) {
+            FILE *out = fopen(dst, "wb");
+            if (out) {
+                char buf[8192];
+                size_t n;
+                while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+                    fwrite(buf, 1, n, out);
+                }
+                fclose(out);
+                fclose(in);
+                unlink(src);
+                result = 0;
+            } else {
+                fclose(in);
+            }
+        }
+    }
     JS_FreeCString(ctx, src);
     JS_FreeCString(ctx, dst);
 
